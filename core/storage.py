@@ -17,8 +17,14 @@ from .settings import settings
 class LocalStorage:
     def __init__(self, output_dir: str | None = None):
         self.output_dir = output_dir or settings.LOCAL_OUTPUT_DIR
-        os.makedirs(self.output_dir, exist_ok=True)
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+        except OSError as exc:
+            raise RuntimeError(
+                "Cant create local output"
+            )
 
+    
     def fetch_input(self, ref: dict) -> str:
         """ref = {'path': ...} or {'content_base64': ..., 'filename': ...}. Returns local path."""
         if ref.get("path"):

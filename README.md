@@ -8,7 +8,16 @@ customer is onboarded by adding one config file — no code change).
 
 It does not introduce any new workflow. Enrichment fields (the AMT / Cross-Reference /
 IK17 join columns, i.e. the `_y` columns in `NEO.py` / `LAO.py`) are left **blank and
-labelled `requires_enrichment`** — never invented. No Snowflake logic is included.
+labelled `requires_enrichment`** — never invented — with one deliberate exception:
+`ComponentCode`, `ModifierCode`, and (on `LAO`) `AssetName` — the equipment-number +
+component-code + modifier-code triple a downstream Snowflake key is built from — are
+now populated where the data genuinely supports it, from two real sources only: the
+customer file itself (when a workbook shape carries these columns directly) and a
+deterministic join against the AMT lookup tables in `prompts/cross-references/*.csv`
+(never the LLM, never a guess). See `prompts/README.md` § "AMT cross-reference
+enrichment" for exactly how, and `core/cross_reference.py` for the per-workbook-shape
+join logic. No other Snowflake logic is included, and every other enrichment field
+stays blank exactly as before.
 
 ---
 
@@ -280,7 +289,12 @@ USE_LLM=false python tests/test_smoke.py CB_MM_LTP_AUGUST.xlsx
 
 Verified run on `CB_MM_LTP_AUGUST.xlsx`: **NEO 9,296 rows · LAO 22,893 rows ·
 Normalized 1,403 rows**; NEO/LAO headers match `FMG_NEO_Aug_26.csv` / `FMG_LAO_Aug_26.csv`
-exactly; customer-file confidence means **NEO 0.813 / LAO 0.99**.
+exactly; customer-file confidence means **NEO 0.704 / LAO 0.558** (deterministic-only;
+was 0.813/0.99 before `ComponentCode`/`ModifierCode`/LAO `AssetName` joined the
+deliverable mean — this workbook genuinely lacks those three columns, so the honest mean
+dropped; see `prompts/README.md` § "AMT cross-reference enrichment"). The AMT
+cross-reference join still recovers `ComponentCode`/`ModifierCode` for 2,637/9,296 NEO
+rows from `fmg_cross-reference.csv` despite the customer file not carrying them at all.
 
 **Additional workflow — standalone reference CSVs instead of one workbook** (an LTP
 export and a Measurement-Points export delivered as their own files, e.g. from Blob
@@ -301,6 +315,10 @@ python run_local.py --reference-files ./test-data/LTP.csv ./test-data/Measuremen
 ## 9. Deliberate non-goals
 
 - **No new workflows** beyond normalization + schema mapping.
-- **No invented columns/values** — enrichment stays blank and labelled.
-- **No Snowflake / warehouse** — file (or blob) output only; enrichment + load happen in
-  your later integration step.
+- **No invented columns/values** — enrichment stays blank and labelled, except the AMT
+  key fields (`ComponentCode`/`ModifierCode`/LAO `AssetName`), which are populated only
+  from the customer file itself or a deterministic AMT cross-reference join — never
+  guessed, never LLM-sourced. See § 1 above and `prompts/README.md`.
+- **No Snowflake / warehouse** — file (or blob) output only; the AMT join above produces
+  the key fields Snowflake needs, but loading/writing to Snowflake itself is still your
+  later integration step.

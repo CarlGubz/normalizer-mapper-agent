@@ -253,13 +253,21 @@
         },
         {
           "canonical": "ComponentCode",
-          "source_class": "enrichment",
-          "join": "Component_Code"
+          "source_class": "customer_file",
+          "dtype": "str",
+          "aliases": [
+            "component code",
+            "comp code"
+          ]
         },
         {
           "canonical": "ModifierCode",
-          "source_class": "enrichment",
-          "join": "Modifier_Code"
+          "source_class": "customer_file",
+          "dtype": "str",
+          "aliases": [
+            "modifier code",
+            "mod code"
+          ]
         },
         {
           "canonical": "TaskTypeCode",
@@ -452,8 +460,14 @@
         },
         {
           "canonical": "AssetName",
-          "source_class": "enrichment",
-          "join": "Equipment"
+          "source_class": "customer_file",
+          "dtype": "str",
+          "aliases": [
+            "eq id",
+            "equipment id",
+            "equipment",
+            "asset"
+          ]
         },
         {
           "canonical": "SerialNumber",
@@ -462,13 +476,25 @@
         },
         {
           "canonical": "ComponentCode",
-          "source_class": "enrichment",
-          "join": "Component_Code"
+          "source_class": "customer_file",
+          "dtype": "str",
+          "aliases": [
+            "cc fl",
+            "component code",
+            "comp code",
+            "cc"
+          ]
         },
         {
           "canonical": "ModifierCode",
-          "source_class": "enrichment",
-          "join": "Modifier_Code"
+          "source_class": "customer_file",
+          "dtype": "str",
+          "aliases": [
+            "mc fl",
+            "modifier code",
+            "mod code",
+            "mc"
+          ]
         },
         {
           "canonical": "TaskTypeCode",

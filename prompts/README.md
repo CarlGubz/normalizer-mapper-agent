@@ -9,10 +9,12 @@ is documented here, separately from the main project README, on request.
 | File | Role |
 |---|---|
 | `schema_mapping_prompt.md` | **Main prompt — the single shared body.** Sent as-is for any workbook that matches no variant below; sent as the *first part* of the prompt for every file that does. Generic — assumes nothing about a specific customer's headers. |
-| `appendix.cb_mm_ltp_august.md` | Appended after the main body for `CB MM LTP AUGUST.xlsx`-shaped workbooks. |
+| `appendix.fmg.md` | Appended after the main body for `CB MM LTP AUGUST.xlsx`-shaped workbooks (variant key `"fmg"` in `core/settings._PROMPT_VARIANTS_BY_FILENAME`). |
 | `appendix.rio_tinto.md` | Appended after the main body for `New Workfile Rio Tinto Aug 2026.xlsx`-shaped workbooks. |
-| `appendix.westrac.md` | Appended after the main body for Westrac workbooks with a `Billiton` sheet (e.g. `[COMBINATION OF ALL FILES]...xlsx`). |
-| `schema_mapping_prompt.backup*.md` | Snapshots of the main prompt from earlier in its evolution (see History below). Not loaded by any code path. |
+| `appendix.bhp.md` | Appended after the main body for Westrac workbooks with a `Billiton` sheet (e.g. `[COMBINATION OF ALL FILES]...xlsx`; variant key `"bhp"`). |
+| `cross-references/*.csv` | AMT lookup tables (equipment/floc → ComponentCode/ModifierCode), one per workbook shape. Not sent to the LLM — read directly in code by `core/cross_reference.py` as a deterministic post-processing pass, after the LLM/scorer step this directory's prompts drive. See "AMT cross-reference enrichment" below. |
+| `appendix.cb_mm_ltp_august.md`, `appendix.westrac.md`, `schema_mapping_prompt.cb_mm_ltp_august.md`, `schema_mapping_prompt.rio_tinto.md`, `schema_mapping_prompt.westrac.md` | **Orphaned** — byte-identical to their `prompt-backups/` counterparts, not read by any code path (`core/settings.py`'s variant keys were renamed to `fmg`/`bhp` and only `schema_mapping_prompt.md` is ever loaded as the main body; see the two rows above). Left in place rather than deleted as part of this change since removing files wasn't asked for — safe to delete. |
+| `schema_mapping_prompt.backup*.md` (top-level) | Same story: identical to `prompt-backups/schema_mapping_prompt.backup*.md`, not loaded by any code path. |
 
 `[01. MAIN - FORECAST] - 251113 Westrac consumption forecast -.xlsx` deliberately has
 **no** appendix — see "Why one file was left out" below. It always gets the main body
@@ -132,14 +134,68 @@ column order/content can legitimately change between a customer's export runs; t
 cheat sheet is a strong prior, never a substitute for the model checking `columns`/
 `samples` in the actual request.
 
-## The one number that's still honestly below 90%: Rio Tinto's LAO (0.776)
+## AMT cross-reference enrichment (equipment number + ComponentCode + ModifierCode)
 
-`FrequencyValue` for Rio Tinto's LAO target has no real source: the `IK07` sheet (the
-Measurement-Points role) is a raw SAP reading log — `Component Hours`, `Total Machine
-Hours`, `Difference`, `Date` — with no interval/frequency column of any kind. This was
-checked directly against the full IK07 column list, not inferred. The model correctly
-returns `source_column: null` / low confidence for it, which is why `LAO_mean` sits at
-0.776 instead of crossing 0.90.
+`ComponentCode` and `ModifierCode` (and, on `LAO`, `AssetName`) used to be pure
+`enrichment` fields — always blank, per this project's original non-goal of never
+inventing enrichment data (see the main README). They're the fields a downstream
+Snowflake key is built from (`AssetName` + `ComponentCode` + `ModifierCode`), so leaving
+them permanently blank was a real gap, not just an unfinished nice-to-have.
+
+Two things changed to close it, both additive and neither touching the "never invent"
+rule itself:
+1. **`config/customers/default.json`**: these three fields are now `source_class:
+   "customer_file"` — mappable like any other field — because several workbook shapes
+   genuinely carry them as real columns (Rio Tinto's `Comp Grid`/`IK07`: `Component
+   Code`/`Modifier Code`/`CC`/`MC`/`CC FL`/`MC FL`, `Eq ID`). This call's own prompt
+   guidance for them is in `schema_mapping_prompt.md` under "ComponentCode /
+   ModifierCode (and, on LAO, AssetName) — the AMT key fields".
+2. **`core/cross_reference.py`**: a deterministic (not LLM) post-processing pass that
+   runs after `builders.build_target`, keyed by workbook shape (`prompt_variant`) +
+   target. It fills a cell **only when it's still blank** after step 1 — it never
+   overwrites a customer_file-derived value — by joining the cleaned rows against the
+   matching `prompts/cross-references/*.csv` AMT lookup table (the files named in the
+   table above). Verified against real test-data workbooks: FMG's `CB MM LTP AUGUST`
+   NEO recovers 2,637/9,296 rows (`Group (L)` + functional-location suffix →
+   `fmg_cross-reference.csv`); Rio Tinto's `IK07` LAO recovers 515 more rows beyond what
+   the sheet's own `CC`/`MC` already had (`Func Loc Key` →
+   `rio-tinto_cross-reference.csv`). BHP/Westrac's NEO path (`Model` + part number →
+   `bhp_cross-reference.csv`'s `CONCAT2`, then parsing the compound `AMT` string) is
+   wired up the same way but **unverified** — no Billiton-shaped workbook exists in
+   `test-data/` to confirm the join key or string format against real data.
+   `mapping_report.mappings[<target>]` gets a `"...+cross_reference"` status suffix and
+   a note with the exact row count whenever this pass fills something, so a fill is
+   always auditable back to "customer file" vs. "AMT lookup," never silently merged.
+
+This also surfaced and fixed a real pre-existing bug in `core/mapping_engine.py`: the
+deterministic scorer's greedy column assignment had no confidence floor, so a
+`customer_file` field with genuinely no real candidate column (exactly the FMG-NEO
+`ComponentCode`/`ModifierCode` case) still got assigned *whatever column was left over*
+— e.g. `Department (C)` — at `reject`-band confidence (~0.40), and that got written
+straight into the output CSV when the LLM was off (or agreed with nothing, which for a
+`reject` band is exactly what it's supposed to do). `_assemble_outputs` now nulls out
+any `reject`-band pick before it reaches `resolved`/the output frame, regardless of
+whether the LLM ran, with a note explaining the rejection — consistent with the
+"an honest gap beats a false match" rule already stated above for confidence generally.
+
+## The one number that changed because of the above: Rio Tinto's LAO (0.776 → 0.815)
+
+`FrequencyValue` for Rio Tinto's LAO target still has no real source: the `IK07` sheet
+(the Measurement-Points role) is a raw SAP reading log — `Component Hours`, `Total
+Machine Hours`, `Difference`, `Date` — with no interval/frequency column of any kind.
+This was checked directly against the full IK07 column list, not inferred. The model
+correctly returns `source_column: null` / low confidence for it — that part is
+unchanged. `LAO_mean` moved from 0.776 to 0.815 anyway, because three more fields
+(`AssetName`, `ComponentCode`, `ModifierCode`) are now counted in the deliverable mean
+per the AMT cross-reference section above, and for Rio Tinto they score highly
+(`Eq ID`/`CC FL`/`MC FL` are real, well-populated columns) — a net improvement to the
+mean's honesty, not a relaxed bar. The reverse happened for `CB MM LTP AUGUST`'s
+`NEO_mean` (0.813 → 0.704) and `LAO_mean` (0.99 → 0.558): that workbook genuinely lacks
+these three fields (see `appendix.fmg.md`), so counting them in the mean — which was
+never done before this change — correctly drags the number down instead of hiding the
+gap. Both directions are the same principle: the mean now reflects real field coverage,
+which is a shift in what's being measured, not a change to how confidence itself is
+computed.
 
 This was **not** forced upward, and won't be by a future prompt edit either, without
 misrepresenting real quality: doing so would mean shipping a fabricated frequency value

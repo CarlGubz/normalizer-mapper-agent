@@ -32,10 +32,20 @@ import uuid
 import base64
 import copy
 from datetime import datetime, timezone
+from pathlib import Path
 
 from core.settings import load_customer_config
 from core.mapping_engine import run_mapping, run_mapping_from_reference_files
 from core.storage import get_storage
+
+
+_EXCEL_EXTENSIONS = {".xlsx", ".xls", ".xlsm", ".xlsb"}
+_CSV_EXTENSIONS = {".csv"}
+_FILE_TYPE_ALIASES = {
+    "excel": "excel", "xlsx": "excel", "xls": "excel", "workbook": "excel",
+    "csv": "csv",
+}
+
 
 
 def _normalize_ref(ref) -> dict:
@@ -44,6 +54,28 @@ def _normalize_ref(ref) -> dict:
     if isinstance(ref, str):
         return {"path": ref}
     return ref
+
+def _resolve_file_type(ref: dict, explicit: str | None) -> str:
+    """'excel' or 'csv' for a single "input" ref — an explicit "fileType" wins, else
+    it's detected from the file's own extension (ref['filename'] if set, else the tail
+    of ref['path'])."""
+    if explicit:
+        resolved = _FILE_TYPE_ALIASES.get(explicit.strip().lower())
+        if not resolved:
+            raise ValueError(f"Unrecognized fileType {explicit!r} — expected 'excel' or 'csv'")
+        return resolved
+
+    name = ref.get("filename") or ref.get("path") or ""
+    ext = Path(name.split("?")[0]).suffix.lower()
+    if ext in _CSV_EXTENSIONS:
+        return "csv"
+    if ext in _EXCEL_EXTENSIONS:
+        return "excel"
+    raise ValueError(
+        f"Can't determine file type for {name!r} — pass \"fileType\": \"excel\" or "
+        "\"csv\" explicitly."
+    )
+
 
 
 def _default_run_id() -> str:
@@ -73,8 +105,17 @@ def run_agent(request: dict) -> dict:
             ]
             result = run_mapping_from_reference_files(input_paths, cfg)
         elif request.get("input"):
-            input_path = storage.fetch_input(_normalize_ref(request["input"]))
-            result = run_mapping(input_path, cfg)
+            # input_path = storage.fetch_input(_normalize_ref(request["input"]))
+            ref = _normalize_ref(request["input"])
+            input_path = storage.fetch_input(ref)
+            file_type = _resolve_file_type(ref, request.get("fileType"))
+            if file_type == "csv":
+                # A single standalone CSV under "input" — same handling as
+                # reference_files: [input], just without requiring the caller to
+                # switch request shape depending on file type.
+                result = run_mapping_from_reference_files([input_path], cfg)
+            else:
+                result = run_mapping(input_path, cfg)
         else:
             raise ValueError(
                 "request must include either 'input' (a workbook) or "
@@ -91,7 +132,8 @@ def run_agent(request: dict) -> dict:
                 out_inline[target] = base64.b64encode(df.to_csv(index=False).encode()).decode()
 
         norm = result["normalized"]
-        loc = storage.write_csv(norm, "Normalized.csv", run_id)
+        # loc = storage.write_csv(norm, "Normalized.csv", run_id)
+        loc = storage.write_csv(norm, "Exceptions.csv", run_id)
         out_locations["Normalized"] = loc
         if request.get("return_inline"):
             out_inline["Normalized"] = base64.b64encode(norm.to_csv(index=False).encode()).decode()
@@ -108,9 +150,13 @@ def run_agent(request: dict) -> dict:
         return response
 
     except Exception as exc:  # surface a clean error to the orchestrator
+        from core.settings import settings
         return {
             "status": "failed",
             "run_id": run_id,
             "customer_id": customer_id,
             "error": f"{type(exc).__name__}: {exc}",
+            "storage_backend": settings.STORAGE_BACKEND,
+            "azure_storage_account_url_set": bool(settings.AZURE_STORAGE_ACCOUNT_URL),
+            "azure_storage_connection_string": bool(settings.AZURE_STORAGE_CONNECTION_STRING)
         }

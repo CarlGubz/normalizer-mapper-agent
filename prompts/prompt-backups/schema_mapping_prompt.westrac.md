@@ -86,29 +86,6 @@ For each field in `customer_file_fields`:
      field that is not in `customer_file_fields`.
 
 ====================================================================
-ComponentCode / ModifierCode (and, on LAO, AssetName) — the AMT key fields
-====================================================================
-These three canonical fields together form the equipment-number + component-code +
-modifier-code key downstream systems (Snowflake) join on, so a wrong guess here is
-worse than for most other fields — it produces a key that silently points at the wrong
-asset/component, not just a blank cell.
-  - Some workbook shapes carry Component Code / Modifier Code as real, literal columns
-    (e.g. a sheet with columns actually named "Component Code" / "Modifier Code", or
-    short forms like "CC" / "MC" / "CC FL" / "MC FL"). When more than one such column
-    exists for the same field (e.g. both "CC" and "CC FL"), prefer whichever is more
-    completely populated in `samples`/`evidence` — a "*FL" (functional-location-scoped)
-    variant is often the one a customer's own downstream process already treats as
-    authoritative, and typically has fewer gaps than a raw reading-log column of the
-    same abbreviation.
-  - Other workbook shapes (e.g. an LTP export with no component-code column at all)
-    genuinely do not carry these fields — that is not a mapping failure. Return
-    `source_column: null` honestly. A separate, deterministic AMT cross-reference join
-    (outside this call, in code — see core/cross_reference.py) fills genuine gaps like
-    this from a lookup table afterward; it only fills a cell this call leaves blank, so
-    an honest null here is not a dead end, and a guessed column here would actively
-    block that correct downstream fill by occupying the cell with wrong data first.
-
-====================================================================
 INPUT SHAPE (sent as the user message, JSON)
 ====================================================================
 {
@@ -167,3 +144,43 @@ That cuts both ways:
     for it (not the ideal column, but a legitimate proxy), say so at a moderate
     confidence and name the gap in `notes` — don't round it up to auto_accept.
 When in doubt between a guess and `null`, choose `null` with a clear note.
+
+====================================================================
+KNOWN WORKBOOK CONTEXT — Westrac consumption workbooks with a "Billiton" sheet
+(verify against THIS run's real data; column order/content can change between exports,
+so treat this as a strong prior, not a substitute for actually checking
+`columns`/`samples` below)
+====================================================================
+These workbooks typically have "PARTS" and "COMPONENTS" tabs that are large RAW
+transactional extracts (WORK_ORDER, QUANTITY, MONTH_YEAR_LONG, FUNCTIONAL_LOCATION_
+DESCRIPTION...) — NOT the source sheet, even though "PARTS" matches this customer's
+configured sheet-name pattern. The real source is a much smaller sheet called
+"Billiton": a clean, already field-per-column layout. There is no LAO/measurement-
+points sheet in these workbooks — LAO is expected to stay unmapped for this shape.
+
+Billiton columns verified: Branch, Site, Fleet, Task Counter, Model, Asset Short,
+Equipment, Component Code, Modifier Code, Frequency, Life To Date, Strategy Date,
+Primary Part Number, BHP Part No., Sales Status, PO Number, Comments, Serial Number,
+ST Description, Strategy Usage, Customer, Task Type, plus several match/upload/date
+utility columns (BULK, UPLOAD DATE, AMT Date, MATCH B/C/D to PARTS/COMPONENTS, RLEP,
+Variance).
+
+Fields verified against Billiton:
+  - ModelCode: Model — values like "785C", "793F".
+  - AssetName: Equipment — values like "DT3168 - APX01529" (unit ID + serial pair);
+    "Asset Short" holds just the bare unit ID ("DT3168") as an alternative.
+  - TaskCounterCode: Task Counter — values like "1 - 1", "MAJOR - Major Overhaul".
+  - StrategyTaskDescription: ST Description — values like "1000.00.RB.0 ENGINE".
+  - FrequencyValue: Frequency — numeric hour intervals (15000, 20000, 40000).
+  - StrategyDate: Strategy Date — real datetimes. Note "AMT Date" looks similar but is
+    an unrelated/unreliable near-duplicate column — do not confuse the two.
+  - FunctionalLoc: Billiton genuinely has NO functional-location code column.
+    Branch/Site/Fleet are grouping labels only (e.g. "BHP-Yandi-Trucks"), and "BULK"
+    (despite containing dashes) holds asset-key concatenations, not true FLOC codes.
+    This has repeatedly, correctly scored low (~0.40-0.60). Only override this if
+    THIS run's actual samples show a real FLOC pattern — otherwise null/low
+    confidence is the honest answer; do not force "BULK" or "Fleet" onto it.
+  - NewStrategyDate: Billiton genuinely has no second date distinct from Strategy
+    Date. "UPLOAD DATE" is a batch-upload timestamp (values cluster on month-end
+    dates), not a planned-start date — do not pick it just because it is date-shaped.
+    Treat this as a real gap unless this run's data shows otherwise.
