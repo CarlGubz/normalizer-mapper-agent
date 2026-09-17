@@ -2,7 +2,8 @@
 
 Order (unchanged from the project):
   detect sheets -> profile columns -> deterministic score -> LLM refine (optional)
-  -> normalize/quarantine rows -> build NEO/LAO -> assemble mapping_report.
+  -> normalize/quarantine rows -> build NEO/LAO -> AMT cross-reference enrichment
+  -> post-build exception audit (core/exceptions.py) -> assemble mapping_report.
 
 Two entrypoints share that same order via _assemble_outputs(): run_mapping() resolves
 frames from a multi-sheet workbook (sheet name -> role); run_mapping_from_reference_files()
@@ -15,6 +16,7 @@ import os
 import pandas as pd
 
 from . import profiling, scorer, builders, normalizer, cross_reference
+from . import exceptions as exceptions_mod
 from .llm_mapper import refine_mapping
 from .settings import settings, detect_prompt_variant
 
@@ -216,6 +218,7 @@ def _assemble_outputs(
     }
 
     outputs = {}          # target -> DataFrame
+    exceptions = {}       # target -> DataFrame (core/exceptions.py, post-build audit)
     rejected_frames = []  # Normalized rows across sheets
 
     for target, tcfg in cfg["targets"].items():
@@ -359,9 +362,20 @@ def _assemble_outputs(
 
         report["row_counts"][target] = int(len(outputs[target]))
 
+        # Post-build exception audit (core/exceptions.py) — runs on the FINAL rows,
+        # after cross-reference enrichment above, so a cell it just filled is never
+        # wrongly flagged as missing. Flagged rows stay in outputs[target] untouched;
+        # this is a companion review file, not a quarantine.
+        exceptions[target] = exceptions_mod.find_exceptions(outputs[target], cfg.get("exceptions", {}))
+        report["row_counts"][f"{target}_Exceptions"] = int(len(exceptions[target]))
+        if len(exceptions[target]):
+            report.setdefault("exceptions_by_reason", {})[target] = (
+                exceptions[target]["_exception_reason"].value_counts().to_dict()
+            )
+
     normalized = (
         pd.concat(rejected_frames, ignore_index=True) if rejected_frames else pd.DataFrame()
     )
     report["row_counts"]["Normalized"] = int(len(normalized))
 
-    return {"report": report, "outputs": outputs, "normalized": normalized}
+    return {"report": report, "outputs": outputs, "normalized": normalized, "exceptions": exceptions}

@@ -33,9 +33,13 @@ customer .xlsx
 [4] LLM refine         ← OpenAI reviews/repairs ambiguous columns + writes notes
 [5] normalize rows     ← keyless / identity-missing / banner / gibberish → Normalized.csv
 [6] build outputs      ← NEO.csv + LAO.csv (constants + transforms; enrichment blank)
+[7] AMT cross-reference ← fills SerialNumber/ComponentCode/ModifierCode blanks where the
+                          customer file itself doesn't carry them (core/cross_reference.py)
+[8] exception audit    ← flags rows still missing a critical field, or gibberish, in the
+                          FINAL NEO/LAO rows → NEO_Exceptions.csv / LAO_Exceptions.csv
       │
       ▼
-mapping_report (JSON, confidence per column) + 3 CSVs
+mapping_report (JSON, confidence per column) + 5 CSVs
 ```
 
 The scoring rubric and the prompt are the ones created earlier in this project and live
@@ -62,7 +66,9 @@ fmg_agent/
 │   ├─ normalizer.py          # row quarantine (Normalized.csv)
 │   ├─ transforms.py          # named transforms (only NEO.py/LAO.py logic)
 │   ├─ builders.py            # build NEO/LAO frames from the resolved mapping
-│   └─ mapping_engine.py      # orchestrates the 6 steps above
+│   ├─ cross_reference.py     # AMT lookup enrichment (SerialNumber/ComponentCode/ModifierCode)
+│   ├─ exceptions.py          # post-build audit (NEO_Exceptions.csv / LAO_Exceptions.csv)
+│   └─ mapping_engine.py      # orchestrates the steps above
 ├─ tests/test_smoke.py
 ├─ requirements.txt
 ├─ host.json                  # Azure Functions host config
@@ -81,6 +87,7 @@ Everything customer-specific is data, not code:
 | Constants (RegistrationCounter, UOM…) | `constants{}` | ✅ |
 | Scoring weights / bands / name gate | `scoring{}` | ✅ |
 | Reject rules for normalization | `normalization.reject_rules[]` | ✅ |
+| Which fields trip a post-build exception | `exceptions.critical_fields[]` / `exceptions.gibberish_fields[]` | ✅ |
 | Add a brand-new customer | copy `_TEMPLATE.json` → `<id>.json` | ✅ |
 | Per-call sheet override | `sheet_config_override` in the request body | ✅ |
 | Storage target (local ↔ Azure Blob) | `STORAGE_BACKEND` env var | ✅ |
@@ -115,12 +122,24 @@ URL; see § "Passing Blob paths instead of inline bytes" below).
     "matched_sheets": [...],
     "mappings": { "NEO": [ {"canonical_field","source_column","confidence","band","status","notes"} ], "LAO": [...] },
     "column_confidence_summary": { "NEO_mean": 0.813, "LAO_mean": 0.99 },
-    "row_counts": { "NEO": 9296, "LAO": 22893, "Normalized": 1403 },
+    "row_counts": { "NEO": 9296, "LAO": 22893, "Normalized": 1403, "NEO_Exceptions": 0, "LAO_Exceptions": 0 },
+    "exceptions_by_reason": { "NEO": {"missing ComponentCode": 12} },
     "warnings": [], "llm_used": true
   },
-  "outputs": { "NEO": "<local path|container/blob>", "LAO": "...", "Normalized": "..." }
+  "outputs": {
+    "NEO": "<local path|container/blob>", "LAO": "...", "Normalized": "...",
+    "NEO_Exceptions": "...", "LAO_Exceptions": "..."
+  }
 }
 ```
+`NEO_Exceptions`/`LAO_Exceptions` are a **post-build audit**, not a quarantine: rows
+already written into `NEO.csv`/`LAO.csv` that are still missing a critical field
+(`AssetName`/`SerialNumber`/`ComponentCode`/`ModifierCode` by default — configurable via
+`exceptions.critical_fields`/`exceptions.gibberish_fields` in the customer JSON) after
+mapping *and* AMT cross-reference enrichment have both run. Flagged rows are copied into
+the companion file with an added `_exception_reason` column — they are **not** removed
+from `NEO.csv`/`LAO.csv`. `exceptions_by_reason` only appears per target when that
+target actually has at least one flagged row. See `core/exceptions.py`.
 With `STORAGE_BACKEND=azure_blob`, each `outputs` value is a bare `"<container>/<blob_name>"`
 path (e.g. `"fmg-outbound/a2c969e26557/NEO.csv"`) — same shorthand form accepted for
 `input`/`reference_files` — resolved against the same storage account as the request
@@ -314,11 +333,37 @@ python run_local.py --reference-files ./test-data/LTP.csv ./test-data/Measuremen
 
 ## 9. Deliberate non-goals
 
-- **No new workflows** beyond normalization + schema mapping.
+- **No new workflows** beyond normalization + schema mapping (the post-build exception
+  audit in § below is a review/reporting step on the same outputs, not a new workflow —
+  it never changes what's written to `NEO.csv`/`LAO.csv`).
 - **No invented columns/values** — enrichment stays blank and labelled, except the AMT
-  key fields (`ComponentCode`/`ModifierCode`/LAO `AssetName`), which are populated only
-  from the customer file itself or a deterministic AMT cross-reference join — never
-  guessed, never LLM-sourced. See § 1 above and `prompts/README.md`.
+  key fields (`SerialNumber`/`ComponentCode`/`ModifierCode`/LAO `AssetName`), which are
+  populated only from the customer file itself or a deterministic AMT cross-reference
+  join — never guessed, never LLM-sourced. See § 1 above and `prompts/README.md`.
 - **No Snowflake / warehouse** — file (or blob) output only; the AMT join above produces
   the key fields Snowflake needs, but loading/writing to Snowflake itself is still your
   later integration step.
+- **No row removal in the exception audit** — `NEO_Exceptions.csv`/`LAO_Exceptions.csv`
+  are a copy-out review view of rows already in `NEO.csv`/`LAO.csv`; flagging a row for
+  missing/gibberish data never removes it from the main output.
+
+## 10. Post-build exception audit (NEO_Exceptions.csv / LAO_Exceptions.csv)
+
+Separate from row normalization (§1 step 5, which decides if a *source* row is
+admissible at all, before NEO/LAO exist) — this runs on the **final, already-built**
+NEO/LAO rows, after AMT cross-reference enrichment, and flags any row still missing a
+critical field or holding gibberish in one. Default critical fields: `AssetName`,
+`SerialNumber`, `ComponentCode`, `ModifierCode` — the same identity + AMT-key fields the
+downstream Snowflake key is built from (§1). Configurable per customer via
+`exceptions.critical_fields`/`exceptions.gibberish_fields` in `config/customers/*.json`.
+
+Flagged rows are written to a companion file, **alongside** the main output, with an
+added `_exception_reason` column — they are copied out for review, not removed from
+`NEO.csv`/`LAO.csv`. A workbook shape that genuinely lacks a critical field for every
+row (e.g. `CB MM LTP AUGUST` has no serial number anywhere — see `prompts/README.md`)
+will correctly show up as 100% flagged: that's an honest reflection of a real, permanent
+data gap for that shape, not a bug in the audit.
+
+See `core/exceptions.py` for the implementation and why the critical-field list is kept
+deliberately short (most other fields are legitimately blank sometimes by this
+project's own design — flagging every blank cell would bury the real exceptions).
