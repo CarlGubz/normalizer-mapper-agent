@@ -33,6 +33,13 @@ are a companion, post-build audit — see core/exceptions.py — of rows already
 NEO.csv/LAO.csv that are still missing a critical field (AssetName/SerialNumber/
 ComponentCode/ModifierCode by default) or hold gibberish in one. They are a read-only
 review view, not a quarantine: flagged rows are NOT removed from NEO.csv/LAO.csv.
+
+Every row of every one of those four CSVs (NEO/LAO and their _Exceptions companions)
+also carries a trailing "ConfidenceScore" column — a PER-ROW score, distinct from the
+per-column numbers in mapping_report.mappings/column_confidence_summary. See
+core/row_confidence.py. Its means per file are reported in
+mapping_report.column_confidence_summary as "{target}_row_confidence_mean" and
+"{target}_Exceptions_row_confidence_mean".
 """
 from __future__ import annotations
 import uuid

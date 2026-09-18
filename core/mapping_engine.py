@@ -17,6 +17,7 @@ import pandas as pd
 
 from . import profiling, scorer, builders, normalizer, cross_reference
 from . import exceptions as exceptions_mod
+from . import row_confidence
 from .llm_mapper import refine_mapping
 from .settings import settings, detect_prompt_variant
 
@@ -311,6 +312,25 @@ def _assemble_outputs(
                              "notes": f"join={f.get('join')}"})
         report["mappings"][target] = rows
 
+        # Per-field "trust" for the row-level ConfidenceScore column (core/row_confidence.py)
+        # — a different metric from the column-level numbers above. customer_file fields
+        # use their own computed column-mapping confidence (even a low/rejected one — the
+        # model did attempt it); constant/derived fields are trusted at 1.0 (not a guess).
+        # Plain "enrichment" fields (BranchCode/SiteCode/...) are deliberately left OUT of
+        # this dict for now — this customer shape's cross-reference pass may have no
+        # mechanism to ever fill them, and a field the pipeline never attempts shouldn't
+        # count against every row by the same fixed amount. See core/row_confidence.py's
+        # module docstring. The AMT cross-reference block below adds one back in, at a
+        # high trust, the moment it's actually filled for at least one row of this shape.
+        field_confidence = {
+            r["canonical_field"]: (r["confidence"] or 0.0)
+            for r in rows
+            if r["source_class"] == "customer_file"
+        }
+        field_confidence.update({
+            r["canonical_field"]: 1.0 for r in rows if r["source_class"] in ("constant", "derived")
+        })
+
         # The summary mean is scoped to fields actually written to <target>.csv
         # (output_columns) — not every customer_file field. Some customer_file fields
         # (e.g. FunctionalLoc, MeasTotCtr) exist only as internal join-key/derived-input
@@ -359,6 +379,27 @@ def _assemble_outputs(
                 if row is not None:
                     row["notes"] = (row["notes"] + " | " + note).strip(" |") if row.get("notes") else note
                     row["status"] = f"{row['status']}+cross_reference" if row.get("status") else "cross_reference"
+                # A join match is a deterministic exact-key lookup, not the fuzzy
+                # column-alias guess customer_file confidence measures — e.g. FMG's
+                # ComponentCode has no source column at all (rejected, near-0 confidence)
+                # yet the AMT join fills it reliably. Trust wherever this field was
+                # actually filled this way at least as much as any genuine customer_file
+                # pick for it (see core/row_confidence.py's module docstring).
+                field_confidence[canonical] = max(field_confidence.get(canonical, 0.0), 0.95)
+
+        # Per-row confidence score (core/row_confidence.py) — appended as an EXTRA
+        # trailing column, not part of the fixed output_columns schema. Computed here,
+        # after cross-reference enrichment, so a cell the enrichment pass just filled
+        # counts as present for this row; exceptions[target] below is a row-subset of
+        # this same frame, so it inherits the column automatically, no separate
+        # computation needed there.
+        outputs[target]["ConfidenceScore"] = row_confidence.compute(
+            outputs[target], tcfg.get("output_columns", []), field_confidence
+        )
+        report["column_confidence_summary"][f"{target}_row_confidence_mean"] = (
+            round(float(outputs[target]["ConfidenceScore"].mean()), 3)
+            if len(outputs[target]) else None
+        )
 
         report["row_counts"][target] = int(len(outputs[target]))
 
@@ -368,6 +409,10 @@ def _assemble_outputs(
         # this is a companion review file, not a quarantine.
         exceptions[target] = exceptions_mod.find_exceptions(outputs[target], cfg.get("exceptions", {}))
         report["row_counts"][f"{target}_Exceptions"] = int(len(exceptions[target]))
+        report["column_confidence_summary"][f"{target}_Exceptions_row_confidence_mean"] = (
+            round(float(exceptions[target]["ConfidenceScore"].mean()), 3)
+            if len(exceptions[target]) else None
+        )
         if len(exceptions[target]):
             report.setdefault("exceptions_by_reason", {})[target] = (
                 exceptions[target]["_exception_reason"].value_counts().to_dict()

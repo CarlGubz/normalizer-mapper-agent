@@ -35,11 +35,13 @@ customer .xlsx
 [6] build outputs      ← NEO.csv + LAO.csv (constants + transforms; enrichment blank)
 [7] AMT cross-reference ← fills SerialNumber/ComponentCode/ModifierCode blanks where the
                           customer file itself doesn't carry them (core/cross_reference.py)
-[8] exception audit    ← flags rows still missing a critical field, or gibberish, in the
+[8] row confidence     ← per-row ConfidenceScore column, appended to every NEO/LAO row
+                          (core/row_confidence.py) — distinct from the per-column numbers
+[9] exception audit    ← flags rows still missing a critical field, or gibberish, in the
                           FINAL NEO/LAO rows → NEO_Exceptions.csv / LAO_Exceptions.csv
       │
       ▼
-mapping_report (JSON, confidence per column) + 5 CSVs
+mapping_report (JSON, confidence per column AND per row) + 5 CSVs
 ```
 
 The scoring rubric and the prompt are the ones created earlier in this project and live
@@ -68,6 +70,7 @@ fmg_agent/
 │   ├─ builders.py            # build NEO/LAO frames from the resolved mapping
 │   ├─ cross_reference.py     # AMT lookup enrichment (SerialNumber/ComponentCode/ModifierCode)
 │   ├─ exceptions.py          # post-build audit (NEO_Exceptions.csv / LAO_Exceptions.csv)
+│   ├─ row_confidence.py      # per-row ConfidenceScore column (§11)
 │   └─ mapping_engine.py      # orchestrates the steps above
 ├─ tests/test_smoke.py
 ├─ requirements.txt
@@ -121,7 +124,11 @@ URL; see § "Passing Blob paths instead of inline bytes" below).
   "mapping_report": {
     "matched_sheets": [...],
     "mappings": { "NEO": [ {"canonical_field","source_column","confidence","band","status","notes"} ], "LAO": [...] },
-    "column_confidence_summary": { "NEO_mean": 0.813, "LAO_mean": 0.99 },
+    "column_confidence_summary": {
+      "NEO_mean": 0.813, "LAO_mean": 0.99,
+      "NEO_row_confidence_mean": 0.736, "LAO_row_confidence_mean": 0.398,
+      "NEO_Exceptions_row_confidence_mean": null, "LAO_Exceptions_row_confidence_mean": 0.346
+    },
     "row_counts": { "NEO": 9296, "LAO": 22893, "Normalized": 1403, "NEO_Exceptions": 0, "LAO_Exceptions": 0 },
     "exceptions_by_reason": { "NEO": {"missing ComponentCode": 12} },
     "warnings": [], "llm_used": true
@@ -367,3 +374,29 @@ data gap for that shape, not a bug in the audit.
 See `core/exceptions.py` for the implementation and why the critical-field list is kept
 deliberately short (most other fields are legitimately blank sometimes by this
 project's own design — flagging every blank cell would bury the real exceptions).
+
+## 11. Per-row confidence score (`ConfidenceScore` column)
+
+Every row of `NEO.csv`, `LAO.csv`, and their `_Exceptions` companions carries a trailing
+`ConfidenceScore` column — a **different metric** from everything else in
+`mapping_report`. The existing `mappings[<target>][*].confidence` and
+`column_confidence_summary`'s `NEO_mean`/`LAO_mean` are per-**column** numbers ("how sure
+are we this source column is the right one for this canonical field?") — the same value
+for every row that uses that column. `ConfidenceScore` is per-**row**: for one specific
+built row, how much of what's actually printed in it rests on solid evidence? A column
+mapped at 0.95 confidence can still have a genuinely blank cell on some individual rows
+(that row's own source cell was empty) — that row gets no credit for a field it doesn't
+actually have data for.
+
+Only fields the pipeline actually attempts for a given customer shape count toward it:
+a `customer_file` field's own column-mapping confidence; `constant`/`derived` fields at
+a flat 1.0 (not a guess); an `enrichment` field only once the AMT cross-reference pass
+actually fills it for at least one row of that shape (at 0.95 — an exact deterministic
+join, more reliable than a rejected column-alias guess), so it then varies genuinely
+row-to-row. A field this pipeline has **no** mechanism to ever fill for this customer
+(e.g. `BranchCode`/`SiteCode` — blank for every customer by this project's original
+design) is excluded from the score entirely, not zeroed — it's out of scope by design,
+not a reflection of any one row's quality, so it shouldn't drag every single row down by
+the same fixed amount. See `core/row_confidence.py` for the full reasoning and
+`mapping_report.column_confidence_summary`'s `{target}_row_confidence_mean` /
+`{target}_Exceptions_row_confidence_mean` for the per-file means (§4).
