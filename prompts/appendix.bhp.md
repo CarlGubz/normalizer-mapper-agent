@@ -54,3 +54,9 @@ Fields verified against Billiton:
     real workbook data — this one is best-effort against the cross-reference file's own
     structure only, since no real Billiton workbook exists in test-data/ to confirm the
     join key format or the "AMT" compound-string parse against.
+  - SerialNumber: map "Serial Number" directly if this run's real columns confirm it
+    exists (same unverified-for-this-shape caveat as above). bhp_cross-reference.csv has
+    no serial-number column of its own, so unlike ComponentCode/ModifierCode there is no
+    code-level fallback for this field here — if "Serial Number" genuinely isn't
+    present, return `source_column: null`; it stays a genuine gap, not something the
+    AMT cross-reference pass can recover.
