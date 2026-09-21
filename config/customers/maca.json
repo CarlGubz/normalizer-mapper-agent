@@ -1,0 +1,136 @@
+{
+  "__comment_status": "SCAFFOLD ONLY — no MACA source workbook was supplied in test-data/06. MACA/ (only Maca CrossRef.xlsx, the two already-finalized Maca NEO/LAO Upload May26.csv reference files, and a workflow diagram). This config's sheet_config match_patterns / field aliases are best-effort placeholders copied from the project's generic default profile, NOT verified against a real MACA export — see prompts/appendix.maca.md and the README's onboarding note for MACA. Do not treat a run of this profile as validated until it has been run against MACA's real 'Prepare Workfile' source file and re-checked against Maca NEO/LAO Upload May26.csv.",
+
+  "customer_id": "maca",
+  "description": "MACA Mining — scaffold profile (cross-reference file wired up; source workbook pending). See __comment_status.",
+
+  "sheet_config": [
+    { "role": "LTP",                "target": "NEO", "match_patterns": ["ltp", "major component", "workfile", "amt"], "filename_patterns": ["ltp"] },
+    { "role": "MEASUREMENT_POINTS", "target": "LAO", "match_patterns": ["measurement point", "measuring point"], "filename_patterns": ["measurement points", "measuring points"] }
+  ],
+
+  "constants": {
+    "StrategyUOMCode": "H",
+    "ReviewStatusCode": "Not Reviewed",
+    "NewStrategyUsageValue": "",
+    "TaskCounterCode": "0"
+  },
+
+  "scoring": {
+    "name_weight": 0.6,
+    "value_weight": 0.4,
+    "join_bonus": 0.15,
+    "confidence_cap": 0.99,
+    "bands": { "auto_accept": 0.9, "accept_review": 0.7, "low_review": 0.5 },
+    "min_name_gate": 0.55,
+    "gate_penalty": 0.75
+  },
+
+  "normalization": {
+    "join_key_canonical": "FunctionalLoc",
+    "join_key_role": "MEASUREMENT_POINTS",
+    "reject_rules": ["missing_join_key", "missing_identity", "banner_row", "gibberish"]
+  },
+
+  "deduplication": {},
+
+  "exclusions": {
+    "field": "StrategyTaskDescription",
+    "keywords": []
+  },
+
+  "exceptions": {
+    "critical_fields": ["AssetName", "SerialNumber", "ComponentCode", "ModifierCode"],
+    "gibberish_fields": ["AssetName", "SerialNumber", "ComponentCode", "ModifierCode"]
+  },
+
+  "targets": {
+    "NEO": {
+      "source_sheet_role": "LTP",
+      "identity_canonical": "AssetName",
+      "output_columns": [
+        "BranchCode", "SiteCode", "FleetCode", "CustomerCode", "ModelCode", "AssetName",
+        "SerialNumber", "RegistrationCounter", "ComponentCode", "ModifierCode",
+        "TaskTypeCode", "TaskCounterCode", "StrategyTaskDescription", "FrequencyValue",
+        "LifeToDateValue", "PrimaryPartNumberCode", "NextPartNumberCode",
+        "SourceOfSupplyCode", "StrategyUOMCode", "StrategyUsageValue",
+        "NewStrategyUsageValue", "StrategyDate", "NewStrategyDate", "SalesStatusCode",
+        "ReviewStatusCode", "PartClassificationCode", "SalesLostReasonCode",
+        "SalesStatusCommentsNote", "PurchaseOrderNumber"
+      ],
+      "fields": [
+        { "canonical": "ModelCode", "source_class": "customer_file", "dtype": "model", "aliases": ["model", "model code", "machine model"] },
+        { "canonical": "AssetName", "source_class": "customer_file", "dtype": "str", "aliases": ["equipment", "asset", "asset name", "unit"] },
+        { "canonical": "SerialNumber", "source_class": "customer_file", "dtype": "str", "aliases": ["serial number", "serial no"], "exclude_headers": ["prefix", "pfx"] },
+        { "canonical": "ComponentCode", "source_class": "customer_file", "dtype": "str", "aliases": ["component code", "comp code"], "join": "cross_reference" },
+        { "canonical": "ModifierCode", "source_class": "customer_file", "dtype": "str", "aliases": ["modifier code", "mod code"], "join": "cross_reference" },
+        { "canonical": "TaskTypeCode", "source_class": "customer_file", "dtype": "str", "aliases": ["task type"] },
+        { "canonical": "TaskCounterCode", "source_class": "constant" },
+        { "canonical": "StrategyTaskDescription", "source_class": "customer_file", "dtype": "str", "aliases": ["task name", "st description", "description"] },
+        { "canonical": "FrequencyValue", "source_class": "customer_file", "dtype": "numeric", "aliases": ["frequency", "strategy"] },
+        { "canonical": "LifeToDateValue", "source_class": "customer_file", "dtype": "numeric", "aliases": ["life to date", "counter reading"] },
+        { "canonical": "PrimaryPartNumberCode", "source_class": "customer_file", "dtype": "str", "aliases": ["primary part number"] },
+        { "canonical": "NextPartNumberCode", "source_class": "enrichment", "join": "Next_Part_Number" },
+        { "canonical": "SourceOfSupplyCode", "source_class": "derived", "transform": "source_of_supply", "depends_on": ["PrimaryPartNumberCode"] },
+        { "canonical": "StrategyUOMCode", "source_class": "constant" },
+        { "canonical": "StrategyUsageValue", "source_class": "customer_file", "dtype": "numeric", "aliases": ["strategy usage"] },
+        { "canonical": "NewStrategyUsageValue", "source_class": "constant" },
+        { "canonical": "StrategyDate", "source_class": "customer_file", "dtype": "date", "transform": "to_yyyymmdd", "aliases": ["strategy date", "component due date"] },
+        { "canonical": "NewStrategyDate", "source_class": "customer_file", "dtype": "date", "transform": "to_yyyymmdd", "aliases": ["approved start date", "start date"] },
+        { "canonical": "SalesStatusCode", "source_class": "customer_file", "dtype": "str", "aliases": ["sales status"] },
+        { "canonical": "ReviewStatusCode", "source_class": "constant" },
+        { "canonical": "PartClassificationCode", "source_class": "customer_file", "dtype": "str", "aliases": ["part classification", "next part classification"] },
+        { "canonical": "SalesLostReasonCode", "source_class": "derived", "transform": "sales_lost_reason", "depends_on": ["SalesStatusCode"] },
+        { "canonical": "SalesStatusCommentsNote", "source_class": "customer_file", "dtype": "str", "aliases": ["comments"] },
+        { "canonical": "PurchaseOrderNumber", "source_class": "customer_file", "dtype": "str", "aliases": ["po number"] },
+        { "canonical": "BranchCode", "source_class": "enrichment", "join": "Branch" },
+        { "canonical": "SiteCode", "source_class": "enrichment", "join": "Site" },
+        { "canonical": "FleetCode", "source_class": "enrichment", "join": "Fleet" },
+        { "canonical": "CustomerCode", "source_class": "enrichment", "join": "Customer" },
+        { "canonical": "RegistrationCounter", "source_class": "enrichment", "join": "Registration_Counter" }
+      ]
+    },
+    "LAO": {
+      "source_sheet_role": "MEASUREMENT_POINTS",
+      "identity_canonical": "AssetName",
+      "output_columns": [
+        "BranchCode", "SiteCode", "FleetCode", "CustomerCode", "ModelCode", "AssetName",
+        "SerialNumber", "RegistrationCounter", "ComponentCode", "ModifierCode",
+        "TaskTypeCode", "TaskCounterCode", "StrategyTaskDescription", "FrequencyValue",
+        "LifeToDateValue", "PrimaryPartNumberCode", "ActualPartNumberCode",
+        "SourceOfSupplyCode", "StrategyUOMCode", "StrategyUsageValue",
+        "LastStrategyUsageValue", "StrategyDate", "LastStrategyDate", "SalesStatusCode",
+        "SalesLostReasonCode", "SalesStatusCommentsNote", "PurchaseOrderNumber"
+      ],
+      "fields": [
+        { "canonical": "ModelCode", "source_class": "customer_file", "dtype": "model", "aliases": ["model"] },
+        { "canonical": "AssetName", "source_class": "customer_file", "dtype": "str", "aliases": ["equipment", "asset", "eq id"] },
+        { "canonical": "SerialNumber", "source_class": "customer_file", "dtype": "str", "aliases": ["serial number"], "exclude_headers": ["prefix", "pfx"] },
+        { "canonical": "ComponentCode", "source_class": "customer_file", "dtype": "str", "aliases": ["component code", "comp code"], "join": "cross_reference" },
+        { "canonical": "ModifierCode", "source_class": "customer_file", "dtype": "str", "aliases": ["modifier code", "mod code"], "join": "cross_reference" },
+        { "canonical": "TaskTypeCode", "source_class": "enrichment", "join": "Task_Type" },
+        { "canonical": "TaskCounterCode", "source_class": "constant" },
+        { "canonical": "StrategyTaskDescription", "source_class": "customer_file", "dtype": "str", "aliases": ["description of measuring point", "description"] },
+        { "canonical": "FrequencyValue", "source_class": "customer_file", "dtype": "numeric", "aliases": ["annual estimate", "frequency"] },
+        { "canonical": "LifeToDateValue", "source_class": "customer_file", "dtype": "numeric", "aliases": ["counter reading", "life to date"] },
+        { "canonical": "PrimaryPartNumberCode", "source_class": "enrichment", "join": "Primary_Part_Number" },
+        { "canonical": "ActualPartNumberCode", "source_class": "enrichment", "join": "Next_Part_Number" },
+        { "canonical": "SourceOfSupplyCode", "source_class": "derived", "transform": "source_of_supply", "depends_on": ["PrimaryPartNumberCode"] },
+        { "canonical": "StrategyUOMCode", "source_class": "constant" },
+        { "canonical": "StrategyUsageValue", "source_class": "enrichment", "join": "Strategy_Usage" },
+        { "canonical": "LastStrategyUsageValue", "source_class": "enrichment", "join": "Strategy_Usage" },
+        { "canonical": "StrategyDate", "source_class": "enrichment", "join": "Strategy_Date" },
+        { "canonical": "LastStrategyDate", "source_class": "customer_file", "dtype": "date", "transform": "to_yyyymmdd", "aliases": ["last completed date"] },
+        { "canonical": "SalesStatusCode", "source_class": "enrichment", "join": "Sales_Status" },
+        { "canonical": "SalesLostReasonCode", "source_class": "derived", "transform": "sales_lost_reason", "depends_on": ["SalesStatusCode"] },
+        { "canonical": "SalesStatusCommentsNote", "source_class": "enrichment", "join": "Comments" },
+        { "canonical": "PurchaseOrderNumber", "source_class": "enrichment", "join": "PO_Number" },
+        { "canonical": "BranchCode", "source_class": "enrichment", "join": "Branch" },
+        { "canonical": "SiteCode", "source_class": "enrichment", "join": "Site" },
+        { "canonical": "FleetCode", "source_class": "enrichment", "join": "Fleet" },
+        { "canonical": "CustomerCode", "source_class": "enrichment", "join": "Customer" },
+        { "canonical": "RegistrationCounter", "source_class": "enrichment", "join": "Registration_Counter" }
+      ]
+    }
+  }
+}
