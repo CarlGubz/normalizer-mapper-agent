@@ -2,7 +2,12 @@
 
 Order (unchanged from the project):
   detect sheets -> profile columns -> deterministic score -> LLM refine (optional)
-  -> normalize/quarantine rows -> build NEO/LAO -> assemble mapping_report.
+  -> normalize/quarantine rows -> build NEO/LAO -> AMT cross-reference enrichment
+  -> per-row ConfidenceScore (core/row_confidence.py) -> business-rule exclusion
+  (core/exclusions.py) -> both-blank ComponentCode/ModifierCode removal
+  (core/exceptions.py's split_blank_pair) -> keep-latest-date deduplication
+  (core/deduplication.py) -> post-build exception audit (core/exceptions.py's
+  find_exceptions) -> assemble mapping_report.
 
 Two entrypoints share that same order via _assemble_outputs(): run_mapping() resolves
 frames from a multi-sheet workbook (sheet name -> role); run_mapping_from_reference_files()
@@ -15,6 +20,10 @@ import os
 import pandas as pd
 
 from . import profiling, scorer, builders, normalizer, cross_reference
+from . import exceptions as exceptions_mod
+from . import exclusions as exclusions_mod
+from . import deduplication
+from . import row_confidence
 from .llm_mapper import refine_mapping
 from .settings import settings, detect_prompt_variant
 
@@ -215,8 +224,11 @@ def _assemble_outputs(
         "prompt_variant": prompt_variant or "main",
     }
 
-    outputs = {}          # target -> DataFrame
-    rejected_frames = []  # Normalized rows across sheets
+    outputs = {}           # target -> DataFrame
+    exceptions = {}        # target -> DataFrame (core/exceptions.py, post-build audit + blank-pair removal)
+    rejected_frames = []   # Normalized rows across sheets
+    excluded_frames = []   # ExcludedComponents rows across targets (core/exclusions.py)
+    duplicate_frames = []  # DuplicateDates rows across targets (core/deduplication.py)
 
     for target, tcfg in cfg["targets"].items():
         role = tcfg["source_sheet_role"]
@@ -308,6 +320,25 @@ def _assemble_outputs(
                              "notes": f"join={f.get('join')}"})
         report["mappings"][target] = rows
 
+        # Per-field "trust" for the row-level ConfidenceScore column (core/row_confidence.py)
+        # — a different metric from the column-level numbers above. customer_file fields
+        # use their own computed column-mapping confidence (even a low/rejected one — the
+        # model did attempt it); constant/derived fields are trusted at 1.0 (not a guess).
+        # Plain "enrichment" fields (BranchCode/SiteCode/...) are deliberately left OUT of
+        # this dict for now — this customer shape's cross-reference pass may have no
+        # mechanism to ever fill them, and a field the pipeline never attempts shouldn't
+        # count against every row by the same fixed amount. See core/row_confidence.py's
+        # module docstring. The AMT cross-reference block below adds one back in, at a
+        # high trust, the moment it's actually filled for at least one row of this shape.
+        field_confidence = {
+            r["canonical_field"]: (r["confidence"] or 0.0)
+            for r in rows
+            if r["source_class"] == "customer_file"
+        }
+        field_confidence.update({
+            r["canonical_field"]: 1.0 for r in rows if r["source_class"] in ("constant", "derived")
+        })
+
         # The summary mean is scoped to fields actually written to <target>.csv
         # (output_columns) — not every customer_file field. Some customer_file fields
         # (e.g. FunctionalLoc, MeasTotCtr) exist only as internal join-key/derived-input
@@ -356,12 +387,123 @@ def _assemble_outputs(
                 if row is not None:
                     row["notes"] = (row["notes"] + " | " + note).strip(" |") if row.get("notes") else note
                     row["status"] = f"{row['status']}+cross_reference" if row.get("status") else "cross_reference"
+                # A join match is a deterministic exact-key lookup, not the fuzzy
+                # column-alias guess customer_file confidence measures — e.g. FMG's
+                # ComponentCode has no source column at all (rejected, near-0 confidence)
+                # yet the AMT join fills it reliably. Trust wherever this field was
+                # actually filled this way at least as much as any genuine customer_file
+                # pick for it (see core/row_confidence.py's module docstring).
+                field_confidence[canonical] = max(field_confidence.get(canonical, 0.0), 0.95)
+
+        # Per-row confidence score (core/row_confidence.py) — appended as an EXTRA
+        # trailing column, not part of the fixed output_columns schema. Computed here,
+        # after cross-reference enrichment, so a cell the enrichment pass just filled
+        # counts as present for this row; exceptions[target] below is a row-subset of
+        # this same frame, so it inherits the column automatically, no separate
+        # computation needed there.
+        outputs[target]["ConfidenceScore"] = row_confidence.compute(
+            outputs[target], tcfg.get("output_columns", []), field_confidence
+        )
+
+        # Business-rule row exclusion (core/exclusions.py) — a complete, well-mapped row
+        # can still be removed from NEO/LAO entirely because of what it's ABOUT (its
+        # StrategyTaskDescription matches an excluded category), not any data-quality
+        # issue. Runs after ConfidenceScore so an excluded row keeps its score in
+        # ExcludedComponents.csv; runs before row_counts/the exception audit below so
+        # both reflect only what's actually still in NEO.csv/LAO.csv, and an excluded
+        # row is never also flagged as an exception.
+        excl_cfg = cfg.get("exclusions", {})
+        kept, excluded_rows = exclusions_mod.split_excluded(
+            outputs[target], excl_cfg.get("field"), excl_cfg.get("keywords", [])
+        )
+        if len(excluded_rows):
+            excluded_rows["_source_target"] = target
+            excluded_frames.append(excluded_rows)
+            report.setdefault("excluded_by_keyword", {})[target] = (
+                excluded_rows["_matched_keyword"].value_counts().to_dict()
+            )
+        outputs[target] = kept
+
+        # Both-blank ComponentCode/ModifierCode removal (core/exceptions.py's
+        # split_blank_pair) — unlike the audit below, this ACTUALLY removes the row
+        # (no usable component identity at all), diverting it into the same
+        # NEO_Exceptions.csv/LAO_Exceptions.csv the audit writes to. Runs before the
+        # dedup step so a blank-component junk row never distorts a dedup group.
+        kept, blank_pair_removed = exceptions_mod.split_blank_pair(
+            outputs[target], "ComponentCode", "ModifierCode"
+        )
+        outputs[target] = kept
+
+        # Keep-latest-date deduplication (core/deduplication.py) — a target with no
+        # entry here (or no populated date field for this shape) is a no-op. Runs after
+        # the blank-pair removal above so grouping/latest-date comparisons only ever
+        # see rows with a real component identity.
+        dedup_cfg = cfg.get("deduplication", {}).get(target, {})
+        kept, duplicate_rows = deduplication.split_duplicates(
+            outputs[target], dedup_cfg.get("group_by", []), dedup_cfg.get("date_field")
+        )
+        if len(duplicate_rows):
+            duplicate_rows["_source_target"] = target
+            duplicate_frames.append(duplicate_rows)
+        outputs[target] = kept
+
+        report["column_confidence_summary"][f"{target}_row_confidence_mean"] = (
+            round(float(outputs[target]["ConfidenceScore"].mean()), 3)
+            if len(outputs[target]) else None
+        )
 
         report["row_counts"][target] = int(len(outputs[target]))
+        report["row_counts"][f"{target}_ExcludedComponents"] = int(len(excluded_rows))
+        report["row_counts"][f"{target}_DuplicateDates"] = int(len(duplicate_rows))
+
+        # Post-build exception audit (core/exceptions.py) — runs on the FINAL rows,
+        # after cross-reference enrichment above, so a cell it just filled is never
+        # wrongly flagged as missing. Combined with blank_pair_removed above into one
+        # file: audited rows stay in outputs[target] untouched (_removed_from_output
+        # False); blank_pair_removed rows are already gone from it (True).
+        audited = exceptions_mod.find_exceptions(outputs[target], cfg.get("exceptions", {}))
+        exceptions[target] = (
+            pd.concat([audited, blank_pair_removed], ignore_index=True)
+            if len(blank_pair_removed) else audited
+        )
+        report["row_counts"][f"{target}_Exceptions"] = int(len(exceptions[target]))
+        report["column_confidence_summary"][f"{target}_Exceptions_row_confidence_mean"] = (
+            round(float(exceptions[target]["ConfidenceScore"].mean()), 3)
+            if len(exceptions[target]) else None
+        )
+        if len(exceptions[target]):
+            report.setdefault("exceptions_by_reason", {})[target] = (
+                exceptions[target]["_exception_reason"].value_counts().to_dict()
+            )
+
+    def _combine_or_empty(frames: list, extra_cols: list[str]) -> pd.DataFrame:
+        """pd.concat(frames) when non-empty; otherwise a zero-row frame that still
+        carries real column headers (a built target's own output schema + whichever
+        tag columns this file adds) rather than a bare pd.DataFrame() — a CSV written
+        from a truly columnless frame has no header row at all, which fails to parse
+        back in for any consumer (pandas included) expecting one, even an empty file.
+        """
+        if frames:
+            return pd.concat(frames, ignore_index=True)
+        cols = (list(next(iter(outputs.values())).columns) if outputs else []) + extra_cols
+        return pd.DataFrame(columns=cols)
 
     normalized = (
         pd.concat(rejected_frames, ignore_index=True) if rejected_frames else pd.DataFrame()
     )
     report["row_counts"]["Normalized"] = int(len(normalized))
 
-    return {"report": report, "outputs": outputs, "normalized": normalized}
+    excluded_components = _combine_or_empty(excluded_frames, ["_matched_keyword", "_source_target"])
+    report["row_counts"]["ExcludedComponents"] = int(len(excluded_components))
+
+    duplicate_dates = _combine_or_empty(duplicate_frames, ["_source_target"])
+    report["row_counts"]["DuplicateDates"] = int(len(duplicate_dates))
+
+    return {
+        "report": report,
+        "outputs": outputs,
+        "normalized": normalized,
+        "exceptions": exceptions,
+        "excluded_components": excluded_components,
+        "duplicate_dates": duplicate_dates,
+    }

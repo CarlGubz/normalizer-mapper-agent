@@ -22,10 +22,43 @@ Response contract:
   "run_id": "...",
   "customer_id": "...",
   "mapping_report": { ... },                # confidence per column, row counts, warnings
-  "outputs": { "NEO": "<local path|container/blob>", "LAO": "...", "Normalized": "..." },
+  "outputs": { "NEO": "<local path|container/blob>", "LAO": "...", "Normalized": "...",
+               "NEO_Exceptions": "...", "LAO_Exceptions": "...", "ExcludedComponents": "...",
+               "DuplicateDates": "..." },
   "outputs_inline": { ... base64 ... }      # only when return_inline=true
   "error": "..."                            # only on failure
 }
+
+"NEO_Exceptions"/"LAO_Exceptions" (only present for a target that was actually built)
+combine two severities — see core/exceptions.py — distinguished by a
+"_removed_from_output" column: rows still missing a critical field (AssetName/
+SerialNumber/ComponentCode/ModifierCode by default) or holding gibberish in one are
+flagged for review but left in NEO.csv/LAO.csv (`_removed_from_output=False`); rows
+where ComponentCode AND ModifierCode are BOTH blank carry no usable component identity
+at all and are actually removed (`_removed_from_output=True`).
+
+"ExcludedComponents" (one combined file across NEO+LAO, tagged by a "_source_target"
+column — always present, even if empty, once at least one target was built) holds rows
+REMOVED from NEO.csv/LAO.csv entirely by a business-rule keyword filter on
+StrategyTaskDescription (core/exclusions.py, customer-configurable via
+`exclusions.field`/`exclusions.keywords`) — a content decision, not a data-quality one.
+
+"DuplicateDates" (same one-combined-file-tagged-by-target convention) holds rows
+removed by the keep-latest-date deduplication (core/deduplication.py,
+`deduplication.<target>.group_by`/`date_field`): within a group of rows sharing the
+same group_by field values (the same task, planned on different dates), every row
+except the one with the latest date_field value is removed here.
+
+A row lands in at most one of NEO_Exceptions/LAO_Exceptions (removed case),
+ExcludedComponents, or DuplicateDates — never more than one; see mapping_engine.py's
+`_assemble_outputs` for the exact removal order.
+
+Every row of every one of NEO/LAO and all four companion files above also carries a
+trailing "ConfidenceScore" column — a PER-ROW score, distinct from the per-column
+numbers in mapping_report.mappings/column_confidence_summary. See
+core/row_confidence.py. Its means per file are reported in
+mapping_report.column_confidence_summary as "{target}_row_confidence_mean" and
+"{target}_Exceptions_row_confidence_mean".
 """
 from __future__ import annotations
 import uuid
@@ -131,12 +164,48 @@ def run_agent(request: dict) -> dict:
             if request.get("return_inline"):
                 out_inline[target] = base64.b64encode(df.to_csv(index=False).encode()).decode()
 
+        # Post-build exception audit (core/exceptions.py): a companion review file per
+        # target, alongside NEO.csv/LAO.csv — rows still missing a critical field or
+        # holding gibberish after mapping + cross-reference enrichment. Not a quarantine:
+        # those rows stay in NEO.csv/LAO.csv exactly as built.
+        for target, exc_df in result.get("exceptions", {}).items():
+            key = f"{target}_Exceptions"
+            loc = storage.write_csv(exc_df, f"{target}_Exceptions.csv", run_id)
+            out_locations[key] = loc
+            if request.get("return_inline"):
+                out_inline[key] = base64.b64encode(exc_df.to_csv(index=False).encode()).decode()
+
         norm = result["normalized"]
         # loc = storage.write_csv(norm, "Normalized.csv", run_id)
         loc = storage.write_csv(norm, "Exceptions.csv", run_id)
         out_locations["Normalized"] = loc
         if request.get("return_inline"):
             out_inline["Normalized"] = base64.b64encode(norm.to_csv(index=False).encode()).decode()
+
+        # Business-rule exclusion (core/exclusions.py): rows removed from NEO.csv/LAO.csv
+        # entirely because of what they're about (a StrategyTaskDescription keyword
+        # match), combined across targets into one companion file. Only written when at
+        # least one target was actually built (result["outputs"] non-empty) — mirrors
+        # "Normalized" always being written, but there's no meaningful excluded-components
+        # file if nothing was ever mapped in the first place.
+        if result["outputs"]:
+            excl = result["excluded_components"]
+            loc = storage.write_csv(excl, "ExcludedComponents.csv", run_id)
+            out_locations["ExcludedComponents"] = loc
+            if request.get("return_inline"):
+                out_inline["ExcludedComponents"] = base64.b64encode(excl.to_csv(index=False).encode()).decode()
+
+        # Keep-latest-date deduplication (core/deduplication.py): older duplicate rows
+        # removed from NEO.csv/LAO.csv (same asset+component+modifier+task, an older
+        # planned date than another row for that same group), combined across targets
+        # into one companion file. Same "only if something was built" convention as
+        # ExcludedComponents above.
+        if result["outputs"]:
+            dup = result["duplicate_dates"]
+            loc = storage.write_csv(dup, "DuplicateDates.csv", run_id)
+            out_locations["DuplicateDates"] = loc
+            if request.get("return_inline"):
+                out_inline["DuplicateDates"] = base64.b64encode(dup.to_csv(index=False).encode()).decode()
 
         response = {
             "status": "succeeded",
