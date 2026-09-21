@@ -1,46 +1,122 @@
-"""AMT cross-reference enrichment — fills ComponentCode / ModifierCode (and, for LAO,
-AssetName) from the per-workbook-shape lookup tables in prompts/cross-references/, for
-the shapes where the customer file itself doesn't already carry them.
+"""AMT cross-reference enrichment — fills ComponentCode / ModifierCode / SerialNumber
+(and, for LAO, AssetName) from the per-workbook-shape lookup tables, for the shapes
+where the customer file itself doesn't already carry them. These three fields
+(SerialNumber + ComponentCode + ModifierCode) are the composite key the downstream
+Snowflake population job joins on, so a genuine gap here isn't just a cosmetic blank
+cell — it's a row Snowflake can't key at all.
+
+Source of the lookup CSVs themselves (fmg_cross-reference.csv, rio-tinto_cross-
+reference.csv, bhp_cross-reference.csv): a Blob container, when `settings.
+CROSS_REFERENCE_BLOB_CONTAINER` is set, is tried FIRST; `prompts/cross-references/`
+(bundled with the code) is the fallback — used automatically when no container is
+configured, or when fetching a specific file from it fails for any reason (not found,
+auth, network). This lets an operator update these lookup tables by uploading a new
+blob, no redeploy needed, while the bundled copies keep everything working out of the
+box with zero configuration. See _read_xref_bytes below for exactly how, and
+xref_sources() for how a fallback gets surfaced in mapping_report.warnings (see
+mapping_engine.py). WHICH file a given workbook needs is decided the same way it always
+has been: by `prompt_variant`, itself detected from the input file's own name (see
+settings.detect_prompt_variant) — this module only changed WHERE that file's bytes
+come from, not which file gets picked for which workbook shape.
 
 This runs strictly AFTER builders.build_target(), and only ever fills a cell that is
 still blank — it never overwrites a value the customer file itself provided. When no
-cross-reference row matches, the cell stays blank, same as before: the project's
-existing non-goal ("no invented columns/values") applies here exactly as it does
-everywhere else in the pipeline.
+cross-reference row matches (or, for FMG's LAO fallback below, when the lookup key is
+genuinely ambiguous), the cell stays blank, same as before: the project's existing
+non-goal ("no invented columns/values") applies here exactly as it does everywhere else
+in the pipeline.
 
 Each customer workbook shape needs a different join key because the source data is
 shaped differently (see prompts/appendix.*.md for the verified column layouts):
-  - FMG (CB MM LTP AUGUST): NEO only. Group(L) + the functional-location segments after
+  - FMG (CB MM LTP AUGUST): NEO's Group(L) + the functional-location segments after
     <plant>-MP-<area>-<equipment> looked up against fmg_cross-reference.csv's
-    Group_CompFuncLoc key. Measurement Points (LAO) has no Group(L)/component data at
-    all, so only AssetName (derived from the functional location itself) is filled
-    there — verified against test-data/CB MM LTP AUGUST.xlsx + Measurement-Points.csv.
-  - Rio Tinto: Comp Grid (NEO) already carries Component Code / Modifier Code directly
-    (~82% populated) — no cross-reference needed there. IK07 (LAO) carries blank CC/MC
-    for most rows; Serial prefix + Func Location looked up against
-    rio-tinto_cross-reference.csv's "FuncLoc Key" recovers them, and Eq ID supplies
-    AssetName directly — verified against test-data/New Workfile Rio Tinto Aug 2026.xlsx.
-  - BHP/Westrac (Billiton sheet): NEO only. Model + part number looked up against
-    bhp_cross-reference.csv's CONCAT2 key, then the compound "AMT" string
-    ("1361 - WATER PUMP-00 - (NONE)") is parsed into ComponentCode/ModifierCode. UNVERIFIED
-    against a real Billiton workbook — none exists in test-data/; this path is best-effort
-    from the cross-reference file's own structure and prompts/appendix.bhp.md's documented
-    column list, not confirmed against real data like the other two.
+    Group_CompFuncLoc key fills ComponentCode/ModifierCode there. Measurement Points
+    (LAO) has no Group(L) column at all, so it can't reproduce that same key — instead
+    it falls back to the functional-location suffix ALONE, matched against a version of
+    the same CSV collapsed to unique (Component_Code, Modifier_Code) pairs per suffix
+    (see _index_csv_unique_by). A suffix that maps to more than one distinct pair across
+    different Group(L) values in the source table is a genuine ambiguity (no way to
+    tell which one a given LAO row means without Group(L)) and is deliberately left
+    blank rather than guessed. AssetName is also derived from the functional location
+    itself. There is no full Serial Number anywhere in this shape's source data or in
+    fmg_cross-reference.csv (only a "Serial Prefix" — a model-family code, not a
+    per-unit serial) — SerialNumber is a genuine, unfillable gap for this shape, on
+    both NEO and LAO — verified against test-data/CB MM LTP AUGUST.xlsx +
+    Measurement-Points.csv.
+  - Rio Tinto: Comp Grid (NEO) already carries Component Code / Modifier Code / Serial
+    Number directly as real columns (mapped via customer_file, not this module) — no
+    cross-reference needed there. IK07 (LAO) carries blank CC/MC for most rows and has
+    no Serial Number column at all (only "Serial prefix"); Serial prefix + Func Location
+    looked up against rio-tinto_cross-reference.csv's "FuncLoc Key" recovers
+    ComponentCode/ModifierCode/SerialNumber together (all three live on the same
+    cross-reference row), and Eq ID supplies AssetName directly — verified against
+    test-data/New Workfile Rio Tinto Aug 2026.xlsx.
+  - BHP/Westrac (Billiton sheet): NEO only. Component Code / Modifier Code / Serial
+    Number are documented as real columns on this sheet (mapped via customer_file, not
+    this module, when present). Where they're genuinely blank, Model + part number
+    looked up against bhp_cross-reference.csv's CONCAT2 key lets the compound "AMT"
+    string ("1361 - WATER PUMP-00 - (NONE)") be parsed into ComponentCode/ModifierCode
+    (bhp_cross-reference.csv has no Serial Number column, so that field has no
+    cross-reference fallback here — it relies solely on the sheet's own column).
+    UNVERIFIED against a real Billiton workbook — none exists in test-data/; this path
+    is best-effort from the cross-reference file's own structure and
+    prompts/appendix.bhp.md's documented column list, not confirmed against real data
+    like the other two. This shape has no LAO/measurement-points sheet at all.
 """
 from __future__ import annotations
+import io
 import re
 from functools import lru_cache
 
 import pandas as pd
 
-from .settings import ROOT
+from .settings import ROOT, settings
+from . import storage
 
 XREF_DIR = ROOT / "prompts" / "cross-references"
+
+# {cross-reference filename: "blob" | "local" | "local_fallback"} for every file
+# actually read so far this process — see xref_sources() below.
+_XREF_SOURCE_LOG: dict[str, str] = {}
+
+
+def _read_xref_bytes(name: str) -> tuple[bytes, str]:
+    """(raw CSV bytes, source) for one cross-reference filename — blob first (when
+    configured), prompts/cross-references/ as the fallback. See module docstring.
+
+    "local_fallback" (blob WAS configured but this specific fetch failed) is
+    deliberately distinguished from plain "local" (no blob container configured at
+    all, the normal zero-config case) — the former is worth surfacing to an operator
+    (something isn't working as configured); the latter is completely expected and not
+    warning-worthy on its own.
+    """
+    local_path = XREF_DIR / name
+    if not settings.CROSS_REFERENCE_BLOB_CONTAINER:
+        return local_path.read_bytes(), "local"
+    try:
+        return storage.fetch_blob_bytes(settings.CROSS_REFERENCE_BLOB_CONTAINER, name), "blob"
+    except Exception:
+        # Blob configured but unavailable for this file (not found, auth, network) —
+        # fall back to the bundled copy. If THAT doesn't exist either, read_bytes()
+        # raises and this correctly fails loudly rather than silently skipping
+        # enrichment — there's genuinely nowhere left to get the data from.
+        return local_path.read_bytes(), "local_fallback"
+
+
+def xref_sources() -> dict[str, str]:
+    """{cross-reference filename: "blob"|"local"|"local_fallback"} for every file
+    actually read this process's lifetime. Exposed so mapping_engine.py can surface a
+    "local_fallback" case in mapping_report.warnings without this module needing to
+    know the report's shape.
+    """
+    return dict(_XREF_SOURCE_LOG)
 
 
 @lru_cache(maxsize=8)
 def _load_csv(name: str) -> pd.DataFrame:
-    return pd.read_csv(XREF_DIR / name, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    data, source = _read_xref_bytes(name)
+    _XREF_SOURCE_LOG[name] = source
+    return pd.read_csv(io.BytesIO(data), dtype=str, keep_default_na=False, encoding="utf-8-sig")
 
 
 @lru_cache(maxsize=8)
@@ -53,6 +129,32 @@ def _index_csv(name: str, key_col: str) -> dict:
         if key and key not in index:
             index[key] = row
     return index
+
+
+@lru_cache(maxsize=8)
+def _index_csv_unique_by(name: str, key_col: str, value_cols: tuple[str, ...]) -> dict:
+    """Like _index_csv, but a key is only included when every row sharing it agrees on
+    `value_cols` — an ambiguous key (the same key mapping to more than one distinct
+    combination of values elsewhere in the table) is left out entirely rather than
+    picking an arbitrary row for it.
+
+    Used for FMG's LAO fallback: the cross-reference's real key is Group(L) + floc
+    suffix, but Measurement Points has no Group(L) column, so the suffix alone is all
+    that's available there. Most suffixes still resolve to exactly one component
+    regardless of Group(L); the ones that don't are a genuine "can't tell without more
+    context" case, not a mapping miss, so returning nothing for them is the honest
+    answer rather than a guess that's right ~50/50.
+    """
+    df = _load_csv(name)
+    combos_by_key: dict[str, set] = {}
+    row_by_key: dict[str, dict] = {}
+    for row in df.to_dict(orient="records"):
+        key = row.get(key_col, "")
+        if not key:
+            continue
+        combos_by_key.setdefault(key, set()).add(tuple(row.get(c, "") for c in value_cols))
+        row_by_key.setdefault(key, row)
+    return {k: row_by_key[k] for k, combos in combos_by_key.items() if len(combos) == 1}
 
 
 def _find_column(df: pd.DataFrame, *needles: str) -> str | None:
@@ -150,11 +252,43 @@ def fmg_neo(out: pd.DataFrame, clean_df: pd.DataFrame, resolved: dict) -> dict:
 
 
 def fmg_lao(out: pd.DataFrame, clean_df: pd.DataFrame, resolved: dict) -> dict:
+    """AssetName comes straight out of the functional location. ComponentCode/
+    ModifierCode use a suffix-only fallback (see _index_csv_unique_by's docstring for
+    why): unlike NEO, Measurement Points has no Group(L) to reproduce the real
+    Group_CompFuncLoc key, so only the subset of suffixes that resolve to exactly one
+    component regardless of Group(L) can be filled here — verified against
+    test-data/CB MM LTP AUGUST.xlsx + Measurement-Points.csv: of the cross-reference
+    table's 501 unique functional-location suffixes, 385 resolve to a single
+    Group(L)-independent (Component_Code, Modifier_Code) combination, but only 225 of
+    those 385 actually carry a non-blank code — the rest are genuine gaps in the source
+    table itself (rows marked e.g. "Reason: Not identified" / "Not planned by
+    Westrac"), not something a better join could recover. Net effect: 2,975 / 22,893
+    Measurement Points rows (~13%) get a real ComponentCode/ModifierCode this way; the
+    remaining suffixes are either ambiguous (left blank on purpose — ~18% of rows) or
+    match nothing in the table at all (~51%) or resolve to a table row with no code
+    (~18%). SerialNumber has no source here at all — this shape has no full serial
+    number anywhere, only a "Serial Prefix" family code — so it isn't attempted.
+    """
     floc_col = resolved.get("FunctionalLoc")
     if not floc_col or floc_col not in clean_df.columns:
         return {}
+    filled = {}
+
     equip = clean_df[floc_col].map(_equipment_from_floc)
-    return {"AssetName": _fill_blank(out, "AssetName", equip)}
+    filled["AssetName"] = _fill_blank(out, "AssetName", equip)
+
+    suffix = clean_df[floc_col].map(_floc_suffix_after_equipment)
+    xref = _index_csv_unique_by(
+        "fmg_cross-reference.csv", "Functional_Loc", ("Component_Code", "Modifier_Code")
+    )
+    hits = suffix.map(xref.get)
+    filled["ComponentCode"] = _fill_blank(
+        out, "ComponentCode", hits.map(lambda h: h.get("Component_Code", "") if h else "")
+    )
+    filled["ModifierCode"] = _fill_blank(
+        out, "ModifierCode", hits.map(lambda h: h.get("Modifier_Code", "") if h else "")
+    )
+    return filled
 
 
 def rio_tinto_lao(out: pd.DataFrame, clean_df: pd.DataFrame, resolved: dict) -> dict:
@@ -189,6 +323,9 @@ def rio_tinto_lao(out: pd.DataFrame, clean_df: pd.DataFrame, resolved: dict) -> 
         )
         filled["ModifierCode"] = _fill_blank(
             out, "ModifierCode", hits.map(lambda h: h.get("Final MC", "") if h else "")
+        )
+        filled["SerialNumber"] = _fill_blank(
+            out, "SerialNumber", hits.map(lambda h: h.get("Serial Number", "") if h else "")
         )
 
     eq_col = _find_column(clean_df, "eq id")
