@@ -61,7 +61,9 @@ def _extract_payload(text: str) -> dict:
     workflow: {"input": ...} (one workbook) or {"reference_files": [...]} (one or more
     standalone CSVs, see REFERENCE_FILES.md) — optionally wrapped in a
     {"payload": {...}} / {"input_data": {...}} envelope for callers that prefer a
-    generic outer shape.
+    generic outer shape. A caller that instead sends plain text (e.g. a Logic Apps AI
+    Agent action's message field holding just a blob path/URL, not hand-crafted JSON)
+    has that text treated as the "input" value directly.
     """
     text = (text or "").strip()
     if not text:
@@ -69,9 +71,9 @@ def _extract_payload(text: str) -> dict:
     try:
         body = json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        return {}
+        return {"input": text}
     if not isinstance(body, dict):
-        return {}
+        return {"input": text}
     if "input" in body or "reference_files" in body:  # already the raw contract
         return body
     for key in ("payload", "input_data", "body", "data"):

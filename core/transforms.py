@@ -36,9 +36,30 @@ def as_str(series: pd.Series) -> pd.Series:
     return series.astype("string")
 
 
+def to_int_str(series: pd.Series) -> pd.Series:
+    """'90028980.0' -> '90028980' (Excel reads whole-number ID/code columns as float).
+    Falls back to a plain stripped string for anything that isn't a clean whole number.
+    """
+    def _one(v):
+        if pd.isna(v):
+            return pd.NA
+        try:
+            return str(int(float(v)))
+        except (TypeError, ValueError):
+            return str(v).strip()
+    return series.map(_one).astype("string")
+
+
 def split_dash_first(series: pd.Series) -> pd.Series:
     # e.g. "1000-ENGINE" -> "1000" (used for Component/Task codes in the source pipeline)
     return series.astype("string").str.split("-").str[0].str.strip()
+
+
+def strip_cat_prefix(series: pd.Series) -> pd.Series:
+    # "Cat MD6250" -> "MD6250" (Thiess's Component History sheet prefixes its bare
+    # model code with "Cat ", unlike Supply Plan's own Model column, which is already
+    # bare — used to keep ModelCode consistent between Thiess's NEO and LAO shapes).
+    return series.astype("string").str.replace(r"(?i)^cat\s+", "", regex=True).str.strip()
 
 
 # ---- derived (row-wise, computed from already-resolved canonical columns) ----
@@ -88,6 +109,8 @@ COLUMN_TRANSFORMS = {
     "to_numeric": to_numeric,
     "as_str": as_str,
     "split_dash_first": split_dash_first,
+    "to_int_str": to_int_str,
+    "strip_cat_prefix": strip_cat_prefix,
 }
 
 ROW_TRANSFORMS = {

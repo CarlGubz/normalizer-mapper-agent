@@ -22,6 +22,10 @@ Fields verified against Comp Grid:
     map it directly, do not treat it as unavailable.
   - ModifierCode: "Modifier Code" — values like "LR - LEFT REAR", same column pairing
     and population rate as Component Code above.
+  - SerialNumber: "Serial Number" — values like "F5200103", a real, literal, fully
+    populated column here, distinct from "Serial Prefix" (a shorter family code like
+    "F520" — the first few characters of the serial, not the serial itself). Map
+    SerialNumber to "Serial Number" directly; do not substitute "Serial Prefix" for it.
   - TaskCounterCode: Task Counter — values like "0 - (NONE)", "1 - 1", "01 - 01".
   - StrategyTaskDescription: ST Description — values like "5085.LR.RB.0 PILOT PUMP".
   - FrequencyValue: Frequency — numeric hour intervals (7500.0, 12000.0, 15000.0).
@@ -62,6 +66,14 @@ Fields verified against IK07:
     cross-reference enrichment step in code (core/cross_reference.py), which
     independently reproduces the same 13,757-row coverage via "Func Loc Key" — treat
     any row neither pass fills as a genuine AMT gap, not a mapping miss.
+  - SerialNumber: IK07 genuinely has NO full serial number column — only "Serial
+    prefix" (values like "F520", a family code, not a per-unit serial; verified this
+    is a real, distinct gap, same shape as Rio Tinto's own "Serial Prefix" column on
+    Comp Grid). Return `source_column: null` here; do not substitute "Serial prefix".
+    The same code-level AMT cross-reference pass that recovers ComponentCode/
+    ModifierCode via "Func Loc Key" also recovers the real Serial Number for these rows
+    from rio-tinto_cross-reference.csv (which carries a full "Serial Number" column) —
+    this call has no visibility into that and should not try to replicate it.
   - MeasTotCtr: "Total Machine\nHours" — the cumulative asset-level meter reading.
   - LifeToDateValue: "Component\nHours" is the component-specific cumulative reading
     (as opposed to "Total Machine\nHours", which is asset-level) — do not confuse the
