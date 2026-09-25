@@ -793,3 +793,89 @@ per-customer constant here (it varies per fleet even within one `CustomerCode`),
 there is no safe deterministic source for it, honestly labelled `requires_enrichment`
 rather than guessed — same treatment §1/§9 already document for FMG's own
 never-firing enrichment fields.
+
+## 17. BHP re-onboarding — real workfile replaces the earlier "Billiton" guess (2026-09)
+
+BHP was one of the original three customers (alongside FMG and Rio Tinto — see
+`prompts/README.md`), but its shape was always a guess:
+the earlier `bhp_cross-reference.csv`/`appendix.bhp.md` assumed a clean, pre-mapped
+"Billiton" sheet that no real BHP workbook in `test-data/` ever actually had, and said
+so explicitly ("UNVERIFIED — no Billiton-shaped workbook exists"). A real BHP workfile
+was supplied under `test-data/New-BHP-Workfile/` — a customer input file (`260911
+Westrac Consumption File.xlsx`), a new `bhp-cross-reference.csv`, a `BHP logic
+diagram.xlsx` describing BHP's own join key, and `BHP Workfile Sep26.xlsx` (BHP's own
+working Excel file, whose NEO-tab formulas were read directly to confirm the join
+logic below) — and it settled the shape for good: **`COMPONENTS` + `PARTS`, both raw
+transactional sheets, no "Billiton" sheet anywhere.** BHP now has its own dedicated
+profile (`config/customers/bhp.json`, matching the Thiess/Macmahon/MACA pattern in §16)
+instead of riding on `default.json` + prompt-variant detection alone.
+
+| Customer | Customer file | Cross-reference file | Config |
+|---|---|---|---|
+| BHP | `260911 Westrac Consumption File.xlsx` — **COMPONENTS** + **PARTS** sheets, merged into one NEO source | `bhp-cross-reference.csv` → `bhp_cross-reference.csv` | `config/customers/bhp.json`, `prompts/appendix.bhp.md` |
+
+**Why `COMPONENTS` + `PARTS` merge into ONE NEO source, with no LAO target.** Both
+sheets share nearly identical columns (`COMPONENTS` has one extra:
+`WORK_ORDER_RELEASED`) and are two granularities of the same forward-looking demand
+data, not two different record types — exactly how BHP's own `BHP Workfile Sep26.xlsx`
+treats them (its NEO tab's `XLOOKUP`s check both sheets and take whichever has the
+earlier matching date). `core/mapping_engine.py` gained a small, generic
+`merge_candidates: true` sheet_config flag to support this (concatenate every sheet
+matching a role's patterns into one source, instead of picking the single best one —
+mirrors `run_mapping_from_multiple_workbooks`'s same-role-across-*workbooks* concat,
+just within one workbook's *sheets* instead). LAO was deliberately left unbuilt for
+this shape: `bhp-cross-reference.csv` is a component-level catalog (engines,
+transmissions, drives — verified: 543 unique material numbers, essentially all
+component-level), and `PARTS`' granular consumables (filters, hoses, enclosures — 12,623
+unique material numbers) barely overlap it (only 406 in common, a 3% row-level match
+rate) — building `PARTS` into its own LAO target would produce a file that's almost
+entirely quarantined to `LAO_Exceptions.csv` by the existing both-blank-CC/MC removal
+rule (§ "AMT cross-reference enrichment" in `prompts/README.md`), not a useful output.
+
+**The cross-reference join** (`core/cross_reference.py`'s `bhp_neo`, replacing the old
+unverified `CONCAT2`/AMT-string-parsing logic entirely): replicates the "Cross Ref Key:
+Serial Prefix & Component Unique Code & Location position" key documented in BHP's own
+`BHP logic diagram.xlsx` — AssetName (`SORT_FIELD`) + StrategyTaskDescription
+(`MATERIAL_DESCRIPTION`) + `LOCATION_POSITION`. Serial Prefix isn't itself a source-file
+column (BHP's real workfile looks it up per-asset from AMT, via a `Comp Grid` sheet this
+project has no live feed for) — `bhp_cross-reference.csv` is used self-referentially
+instead, since every one of the 220 distinct assets in the supplied file maps to exactly
+one Serial Prefix. A join key that's ambiguous in the cross-reference (22 of 961 keys
+resolve to more than one distinct ComponentCode/ModifierCode pair) is correctly left
+blank rather than guessed, same convention as every other customer's cross-reference
+join (`_index_csv_unique_by`).
+
+**Other shape-specific mapping decisions** (see `prompts/appendix.bhp.md` for the full
+verified column list): `NewStrategyDate` ← `REQUIREMENT_DATE` (explicit customer
+instruction); `PrimaryPartNumberCode` ← `VENDOR_PART_NUMBER_TOP_VENDOR_LAST_3_YEARS`
+(not `MATERIAL_NUMBER`, which is a numeric SAP ID, not an AMT-shaped part number);
+`LifeToDateValue` ← `LAST_SMU_READING`; `ModelCode`/`FrequencyValue` are genuine,
+permanent gaps — neither sheet carries a model or interval column at all.
+
+**Verified run** (deterministic-only, `USE_LLM=false`, against `260911 Westrac
+Consumption File.xlsx`): `COMPONENTS` (3,262 rows) + `PARTS` (315,019 rows) merge into
+318,281 raw rows → **NEO 1,013 delivered**, every delivered row carrying a real
+AssetName, ComponentCode and ModifierCode (54,989 rows removed by the existing
+`StrategyTaskDescription` keyword exclusions — carried over unchanged from
+`default.json`'s list — 61 removed as older-dated duplicates, 246,169 removed for
+missing both ComponentCode and ModifierCode — an honest reflection of
+`bhp_cross-reference.csv`'s real, partial coverage, not a bug). `NEO_mean` confidence:
+0.99. A second real file of this same shape, `[01. MAIN - FORECAST] - 251113 Westrac
+consumption forecast -.xlsx` (previously excluded from prompt-variant coverage — see
+`prompts/README.md`'s "Why `01. MAIN - FORECAST...xlsx` was left out"), was also run
+and produced consistent results (**NEO 657 delivered** out of 346,551 merged rows).
+
+**Filename detection**: `core/settings._PROMPT_VARIANTS_BY_FILENAME` gained a
+`"westrac consumption"` needle (alongside the pre-existing `"billiton"`) so both real
+files above pick up the `"bhp"` prompt variant automatically. `customer_id: "bhp"` must
+still be passed explicitly by the caller (same as every other dedicated profile in
+§16) — filename detection only selects the LLM appendix/cross-reference pass, not
+which `config/customers/*.json` loads.
+
+`BranchCode`/`SiteCode`/`FleetCode`/`CustomerCode`/`SerialNumber` (mostly),
+`StrategyDate`, `StrategyUsageValue`, `NextPartNumberCode`, `SalesStatusCode`,
+`PartClassificationCode`, `SalesStatusCommentsNote`, and `PurchaseOrderNumber` all stay
+blank for BHP — none of these exist as columns in `COMPONENTS`/`PARTS`, and per the
+project brief these are exactly the fields meant to be populated later from Snowflake
+AMT data, downstream of this pipeline — honestly labelled `requires_enrichment` rather
+than guessed.

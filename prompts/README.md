@@ -11,14 +11,14 @@ is documented here, separately from the main project README, on request.
 | `schema_mapping_prompt.md` | **Main prompt — the single shared body.** Sent as-is for any workbook that matches no variant below; sent as the *first part* of the prompt for every file that does. Generic — assumes nothing about a specific customer's headers. |
 | `appendix.fmg.md` | Appended after the main body for `CB MM LTP AUGUST.xlsx`-shaped workbooks (variant key `"fmg"` in `core/settings._PROMPT_VARIANTS_BY_FILENAME`). |
 | `appendix.rio_tinto.md` | Appended after the main body for `New Workfile Rio Tinto Aug 2026.xlsx`-shaped workbooks. |
-| `appendix.bhp.md` | Appended after the main body for Westrac workbooks with a `Billiton` sheet (e.g. `[COMBINATION OF ALL FILES]...xlsx`; variant key `"bhp"`). |
+| `appendix.bhp.md` | Appended after the main body for BHP/Westrac Consumption File workbooks (`COMPONENTS` + `PARTS` sheets, e.g. `260911 Westrac Consumption File.xlsx`; variant key `"bhp"`). |
 | `cross-references/*.csv` | AMT lookup tables (equipment/floc → SerialNumber/ComponentCode/ModifierCode), one per workbook shape. Not sent to the LLM — read directly in code by `core/cross_reference.py` as a deterministic post-processing pass, after the LLM/scorer step this directory's prompts drive. **This is the fallback copy** — when `CROSS_REFERENCE_BLOB_CONTAINER` is set, a matching Blob container is tried first; see the main `README.md` § "Cross-reference source" for that. See "AMT cross-reference enrichment" below for how the join itself is used. |
 | `appendix.cb_mm_ltp_august.md`, `appendix.westrac.md`, `schema_mapping_prompt.cb_mm_ltp_august.md`, `schema_mapping_prompt.rio_tinto.md`, `schema_mapping_prompt.westrac.md` | **Orphaned** — byte-identical to their `prompt-backups/` counterparts, not read by any code path (`core/settings.py`'s variant keys were renamed to `fmg`/`bhp` and only `schema_mapping_prompt.md` is ever loaded as the main body; see the two rows above). Left in place rather than deleted as part of this change since removing files wasn't asked for — safe to delete. |
 | `schema_mapping_prompt.backup*.md` (top-level) | Same story: identical to `prompt-backups/schema_mapping_prompt.backup*.md`, not loaded by any code path. |
 
-`[01. MAIN - FORECAST] - 251113 Westrac consumption forecast -.xlsx` deliberately has
-**no** appendix — see "Why one file was left out" below. It always gets the main body
-alone.
+`[01. MAIN - FORECAST] - 251113 Westrac consumption forecast -.xlsx` now matches
+`appendix.bhp.md` too (via the `"westrac consumption"` filename needle) — see "Why
+`01. MAIN - FORECAST...xlsx` was left out" below for how that changed.
 
 **Composition, not duplication.** These are not three standalone full prompts — an
 earlier version of this setup was (three complete copies of the main body, each with a
@@ -37,10 +37,14 @@ workbook shape.
 
 ```python
 _PROMPT_VARIANTS_BY_FILENAME = {
-    "cb mm ltp": "cb_mm_ltp_august",
+    "cb mm ltp": "fmg",
     "rio tinto": "rio_tinto",
-    "billiton": "westrac",
-    "combination of all files": "westrac",
+    "billiton": "bhp",
+    "westrac consumption": "bhp",
+    "combination of all files": "bhp",
+    "thiess": "thiess",
+    "macmahon": "macmahon",
+    "maca": "maca",
 }
 ```
 
@@ -184,13 +188,24 @@ rule itself:
      prefix"). `Comp Grid` (NEO) needs no cross-reference for any of the three — it
      carries `Serial Number` as a real, fully-populated column, mapped directly by step
      1 above.
-   - BHP/Westrac's NEO path (`Model` + part number → `bhp_cross-reference.csv`'s
-     `CONCAT2`, then parsing the compound `AMT` string) fills `ComponentCode`/
-     `ModifierCode` the same way but **unverified** — no Billiton-shaped workbook exists
-     in `test-data/` to confirm the join key or string format against real data.
-     `bhp_cross-reference.csv` has no serial-number column, so `SerialNumber` here
-     relies solely on the sheet's own column (also unverified) with no code-level
-     fallback. This shape has no LAO/measurement-points sheet at all.
+   - BHP/Westrac's NEO path (`COMPONENTS` + `PARTS`, merged into one source — see
+     `config/customers/bhp.json`'s `merge_candidates` and `prompts/appendix.bhp.md`)
+     recovers `ComponentCode`/`ModifierCode` entirely from `bhp_cross-reference.csv` —
+     neither sheet has a real column for either. The join replicates BHP's own "Cross
+     Ref Key: Serial Prefix & Component Unique Code & Location position" logic
+     (`BHP logic diagram.xlsx`): AssetName + StrategyTaskDescription +
+     LOCATION_POSITION, with Serial Prefix looked up per-asset from
+     `bhp_cross-reference.csv` itself (self-referential — every asset in the supplied
+     file maps to exactly one Serial Prefix, so no live AMT/'Comp Grid' feed is
+     needed). Verified against `test-data/New-BHP-Workfile/260911 Westrac Consumption
+     File.xlsx`: recovers ~1,013 NEO rows with real `ComponentCode`/`ModifierCode` out
+     of 318,281 merged source rows — genuinely partial by design, since
+     `bhp_cross-reference.csv` is a component-level catalog (engines, transmissions,
+     drives) that `PARTS`' granular consumables mostly aren't in (this is also why
+     `PARTS` feeds NEO instead of its own LAO target — see `appendix.bhp.md`).
+     `SerialNumber` relies solely on each sheet's own (real but sparse) `SERIAL_NUMBER`
+     column, with no cross-reference fallback. This shape has no LAO/measurement-points
+     source at all.
 
    `mapping_report.mappings[<target>]` gets a `"...+cross_reference"` status suffix and
    a note with the exact row count whenever this pass fills something, so a fill is
@@ -247,15 +262,20 @@ intervals) or a scope decision (mark `FrequencyValue` as `enrichment` for this
 customer's LAO target in `config/customers/default.json`, if it's genuinely expected to
 come from elsewhere downstream) — not a prompt change.
 
-## Why `01. MAIN - FORECAST...xlsx` was left out
+## Why `01. MAIN - FORECAST...xlsx` was left out (superseded)
 
-Per instruction. It has no clean, pre-mapped sheet at all — only `PARTS`/`COMPONENTS`,
-the same raw transactional extract in both tabs. Its low score (0.494) is an accurate
-report of "this data isn't here," and a dedicated cheat sheet for it would have nothing
-true to say beyond "there is no good column for these fields," which the main prompt
-already handles correctly. Giving it special treatment risked normalizing the idea that
-every file should be pushed to 90% regardless of what's actually in it — which is
-exactly the failure mode the honesty rules above exist to prevent.
+**No longer accurate — kept for history.** This file was originally excluded on the
+assumption that BHP's real source was a clean, pre-mapped "Billiton" sheet, and
+`PARTS`/`COMPONENTS` (the only tabs this file actually has) were raw extracts to be
+ignored. A real BHP workfile (`test-data/New-BHP-Workfile/`, supplied later) confirmed
+the opposite: `COMPONENTS`/`PARTS` **are** BHP's real, only source shape — no
+"Billiton" sheet exists in production data at all, and the `ComponentCode`/
+`ModifierCode` low-coverage problem this file's 0.494 score was flagging is real, but
+it's a cross-reference-coverage gap (see the AMT cross-reference section above), not a
+sign this data doesn't belong in NEO at all. `appendix.bhp.md` and
+`config/customers/bhp.json` now handle this shape directly (`merge_candidates` combines
+`COMPONENTS` + `PARTS` into one NEO source), and this file matches the same `"bhp"`
+variant as the new Westrac Consumption File.
 
 ## History
 

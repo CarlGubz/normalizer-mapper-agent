@@ -82,8 +82,26 @@ def _resolve_workbook_roles(workbook_path: str, cfg: dict) -> tuple[dict, dict, 
     #      sheet named after the customer, e.g., rather than "LTP"/"parts"/etc.) — only
     #      swap in a rescued sheet when it clearly, decisively fits better.
     role_to_sheet, warnings, claimed = {}, [], set()
+    sheet_config_by_role = {e["role"]: e for e in cfg["sheet_config"]}
 
     for role, info in sheet_match["matched"].items():
+        # Some customer shapes split ONE role's data across several separately-named
+        # tabs in the same workbook that are meant to be concatenated, not picked
+        # between (e.g. BHP's COMPONENTS + PARTS both feeding NEO — see
+        # prompts/appendix.bhp.md). Opt-in via "merge_candidates": true on the
+        # sheet_config entry, mirroring run_mapping_from_multiple_workbooks()'s
+        # same-role-across-workbooks concat below, just within one workbook instead.
+        if sheet_config_by_role.get(role, {}).get("merge_candidates") and len(info["candidates"]) > 1:
+            merge_key = f"{role} (merged from {len(info['candidates'])} sheets)"
+            frames[merge_key] = pd.concat([frames[s] for s in info["candidates"]], ignore_index=True)
+            role_to_sheet[role] = merge_key
+            claimed.update(info["candidates"])
+            warnings.append(
+                f"Role {role}: merged sheets {info['candidates']} into one source "
+                f"({len(frames[merge_key])} rows) per customer config's merge_candidates."
+            )
+            continue
+
         target_fields = cfg["targets"].get(info["target"], {}).get("fields", [])
         scoring = cfg["scoring"]
         candidates = [s for s in info["candidates"] if s not in claimed] or info["candidates"]

@@ -1,62 +1,76 @@
 ====================================================================
-KNOWN WORKBOOK CONTEXT — Westrac consumption workbooks with a "Billiton" sheet
+KNOWN WORKBOOK CONTEXT — BHP/Westrac Consumption File (COMPONENTS + PARTS sheets)
 (verify against THIS run's real data; column order/content can change between exports,
 so treat this as a strong prior, not a substitute for actually checking
 `columns`/`samples` below)
 ====================================================================
-These workbooks typically have "PARTS" and "COMPONENTS" tabs that are large RAW
-transactional extracts (WORK_ORDER, QUANTITY, MONTH_YEAR_LONG, FUNCTIONAL_LOCATION_
-DESCRIPTION...) — NOT the source sheet, even though "PARTS" matches this customer's
-configured sheet-name pattern. The real source is a much smaller sheet called
-"Billiton": a clean, already field-per-column layout. There is no LAO/measurement-
-points sheet in these workbooks — LAO is expected to stay unmapped for this shape.
+Verified against test-data/New-BHP-Workfile/260911 Westrac Consumption File.xlsx +
+bhp-cross-reference.csv + BHP logic diagram.xlsx + BHP Workfile Sep26.xlsx (BHP's own
+working file, whose NEO tab formulas were reverse-engineered to confirm this join —
+see core/cross_reference.py's bhp_neo docstring). A second real file of this same shape,
+`[01. MAIN - FORECAST] - 251113 Westrac consumption forecast -.xlsx`, was also checked
+and matches.
 
-Billiton columns verified: Branch, Site, Fleet, Task Counter, Model, Asset Short,
-Equipment, Component Code, Modifier Code, Frequency, Life To Date, Strategy Date,
-Primary Part Number, BHP Part No., Sales Status, PO Number, Comments, Serial Number,
-ST Description, Strategy Usage, Customer, Task Type, plus several match/upload/date
-utility columns (BULK, UPLOAD DATE, AMT Date, MATCH B/C/D to PARTS/COMPONENTS, RLEP,
-Variance).
+There is **no clean, pre-mapped "Billiton" sheet in this shape** — that was an earlier,
+never-verified guess (see prompts/README.md's history). The real source is always two
+raw transactional sheets, `COMPONENTS` and `PARTS`, with near-identical columns
+(`COMPONENTS` has one extra: `WORK_ORDER_RELEASED`). `config/customers/bhp.json` merges
+both into ONE NEO source (`merge_candidates: true` on the LTP-role sheet_config entry) —
+this mirrors BHP's own master workfile (`BHP Workfile Sep26.xlsx`), whose NEO tab pulls
+the earliest matching `REQUIREMENT_DATE` from EITHER sheet via `XLOOKUP` against both.
+**There is no LAO/measurement-points source for this shape at all**: `PARTS` (granular
+consumables — filters, hoses, enclosures) is merged into the same NEO source rather than
+built into its own LAO target, because `bhp-cross-reference.csv` is a component-level
+catalog (engines, transmissions, drives) that `PARTS` material numbers essentially never
+match — treating `PARTS` as its own LAO would produce a file that's almost entirely
+quarantined to `LAO_Exceptions.csv` (both `ComponentCode`/`ModifierCode` blank) rather
+than a useful output.
 
-NOTE — this documented column list was carried over from before this project had a
-real Billiton-shaped workbook to test against (none exists in test-data/; the one
-Westrac-family file present, "01. MAIN - FORECAST...", is deliberately excluded, see
-below). "Component Code" / "Modifier Code" being literal columns here (like Rio
-Tinto's Comp Grid) is the working assumption, not independently re-verified. If this
-run's real `columns`/`samples` disagree with anything below, trust the real data.
+COMPONENTS/PARTS columns verified: REQUIREMENT_DATE, MONTH_YEAR_LONG, ASSET_SHORT,
+PLANT, MATERIAL_NUMBER, MATERIAL_DESCRIPTION, QUANTITY, WORK_ORDER,
+[WORK_ORDER_RELEASED — COMPONENTS only], DEMAND_TYPE, LEAD_TIME, SORT_FIELD,
+VENDOR_PART_NUMBER_TOP_VENDOR_LAST_3_YEARS, LAST_SMU_READING, COMPONENT_PIECE,
+LOCATION_POSITION, FUNCTIONAL_LOCATION_DESCRIPTION, SERIAL_NUMBER.
 
-Fields verified against Billiton:
-  - ModelCode: Model — values like "785C", "793F".
-  - AssetName: Equipment — values like "DT3168 - APX01529" (unit ID + serial pair);
-    "Asset Short" holds just the bare unit ID ("DT3168") as an alternative.
-  - TaskCounterCode: Task Counter — values like "1 - 1", "MAJOR - Major Overhaul".
-  - StrategyTaskDescription: ST Description — values like "1000.00.RB.0 ENGINE".
-  - FrequencyValue: Frequency — numeric hour intervals (15000, 20000, 40000).
-  - StrategyDate: Strategy Date — real datetimes. Note "AMT Date" looks similar but is
-    an unrelated/unreliable near-duplicate column — do not confuse the two.
-  - FunctionalLoc: Billiton genuinely has NO functional-location code column.
-    Branch/Site/Fleet are grouping labels only (e.g. "BHP-Yandi-Trucks"), and "BULK"
-    (despite containing dashes) holds asset-key concatenations, not true FLOC codes.
-    This has repeatedly, correctly scored low (~0.40-0.60). Only override this if
-    THIS run's actual samples show a real FLOC pattern — otherwise null/low
-    confidence is the honest answer; do not force "BULK" or "Fleet" onto it.
-  - NewStrategyDate: Billiton genuinely has no second date distinct from Strategy
-    Date. "UPLOAD DATE" is a batch-upload timestamp (values cluster on month-end
-    dates), not a planned-start date — do not pick it just because it is date-shaped.
-    Treat this as a real gap unless this run's data shows otherwise.
-  - ComponentCode / ModifierCode: map "Component Code" / "Modifier Code" directly if
-    this run's real columns confirm they exist (see the NOTE above — unverified for
-    this shape specifically). If they genuinely aren't present, return `source_column:
-    null` rather than guessing — a code-in-code AMT cross-reference fallback
-    (core/cross_reference.py's bhp_neo, Model + "Primary Part Number"/"BHP Part No."
-    looked up against bhp_cross-reference.csv) fills blanks afterward from the lookup
-    table, but — unlike the FMG and Rio Tinto join keys, which were verified against
-    real workbook data — this one is best-effort against the cross-reference file's own
-    structure only, since no real Billiton workbook exists in test-data/ to confirm the
-    join key format or the "AMT" compound-string parse against.
-  - SerialNumber: map "Serial Number" directly if this run's real columns confirm it
-    exists (same unverified-for-this-shape caveat as above). bhp_cross-reference.csv has
-    no serial-number column of its own, so unlike ComponentCode/ModifierCode there is no
-    code-level fallback for this field here — if "Serial Number" genuinely isn't
-    present, return `source_column: null`; it stays a genuine gap, not something the
-    AMT cross-reference pass can recover.
+Fields verified against COMPONENTS/PARTS:
+  - AssetName: SORT_FIELD — the bare asset/equipment unit ID (e.g. "DT5167", "GR7111"),
+    NOT ASSET_SHORT (that column just holds a site/region code like "WAIO"). This is
+    also the asset key `core/cross_reference.py`'s bhp_neo joins on.
+  - NewStrategyDate: REQUIREMENT_DATE — explicit customer mapping logic for this shape
+    (per the project brief: "RequirementDate values from Customer Input file will serve
+    as NewStrategyDate value in the NEO files"). Real Excel datetimes.
+  - StrategyTaskDescription: MATERIAL_DESCRIPTION — e.g.
+    "ENGINE,SX,C175,HASTDEER 3659319X". Also the text half of the ComponentCode/
+    ModifierCode cross-reference join key (see below).
+  - PrimaryPartNumberCode: VENDOR_PART_NUMBER_TOP_VENDOR_LAST_3_YEARS (e.g.
+    "3659319X") — NOT MATERIAL_NUMBER, which is a numeric SAP-style ID (e.g. 11034966)
+    that doesn't match AMT's alphanumeric part-number convention at all.
+  - LifeToDateValue: LAST_SMU_READING (a service-meter-hours reading) — best-effort but
+    reasonable; no more literal "life to date" column exists.
+  - SerialNumber: SERIAL_NUMBER — a real column but genuinely sparse (COMPONENTS: ~1.5%
+    of rows; PARTS: ~40%). Map directly when present; a genuine gap otherwise, same as
+    every other shape in this project — no cross-reference fallback exists for it here.
+  - ModelCode: genuinely absent — neither sheet has a Model/machine-type column
+    (ASSET_SHORT/PLANT are site codes, not models). A real, permanent gap for this
+    shape — return `source_column: null` rather than guessing.
+  - FrequencyValue: genuinely absent — no interval/frequency column anywhere in this
+    shape's source data. A real gap.
+  - FunctionalLoc: FUNCTIONAL_LOCATION_DESCRIPTION — present, but it's a
+    component-plus-asset text string (e.g. "Engine DT5167", "Control System DT5472"),
+    not a segmented floc code like FMG's. Used only for row-quarantine/banner checks
+    here, not a cross-sheet join key (COMPONENTS and PARTS are independent tables, not
+    a role pair that shares a real floc-overlap bonus).
+  - ComponentCode / ModifierCode: **no real column on either sheet at all** — always
+    return `source_column: null` for these; do not force a match. They're recovered
+    entirely by `core/cross_reference.py`'s bhp_neo, which replicates the "Cross Ref
+    Key: Serial Prefix & Component Unique Code & Location position" join documented in
+    BHP's own "BHP logic diagram.xlsx": AssetName + StrategyTaskDescription +
+    LOCATION_POSITION, with Serial Prefix looked up per-asset from
+    bhp_cross-reference.csv itself (self-referential — no live AMT feed needed, since
+    every asset in the supplied file maps to exactly one Serial Prefix). Coverage is
+    real but partial and deliberately asymmetric: bhp_cross-reference.csv is a
+    component-level catalog (engines, transmissions, drives, axles), so COMPONENTS
+    rows recover ComponentCode/ModifierCode at a meaningful rate (~25-30%) while PARTS
+    rows (granular consumables) almost never match — this is why PARTS is merged into
+    the same NEO source instead of driving its own target (see above), not a mapping
+    bug to fix here.

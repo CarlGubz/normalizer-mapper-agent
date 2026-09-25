@@ -163,6 +163,7 @@ _PROMPT_VARIANTS_BY_FILENAME = {
     "cb mm ltp": "fmg",
     "rio tinto": "rio_tinto",
     "billiton": "bhp",
+    "westrac consumption": "bhp",
     "combination of all files": "bhp",
     "thiess": "thiess",
     "macmahon": "macmahon",

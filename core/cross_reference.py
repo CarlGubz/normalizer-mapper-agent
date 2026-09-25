@@ -52,17 +52,31 @@ shaped differently (see prompts/appendix.*.md for the verified column layouts):
     ComponentCode/ModifierCode/SerialNumber together (all three live on the same
     cross-reference row), and Eq ID supplies AssetName directly — verified against
     test-data/New Workfile Rio Tinto Aug 2026.xlsx.
-  - BHP/Westrac (Billiton sheet): NEO only. Component Code / Modifier Code / Serial
-    Number are documented as real columns on this sheet (mapped via customer_file, not
-    this module, when present). Where they're genuinely blank, Model + part number
-    looked up against bhp_cross-reference.csv's CONCAT2 key lets the compound "AMT"
-    string ("1361 - WATER PUMP-00 - (NONE)") be parsed into ComponentCode/ModifierCode
-    (bhp_cross-reference.csv has no Serial Number column, so that field has no
-    cross-reference fallback here — it relies solely on the sheet's own column).
-    UNVERIFIED against a real Billiton workbook — none exists in test-data/; this path
-    is best-effort from the cross-reference file's own structure and
-    prompts/appendix.bhp.md's documented column list, not confirmed against real data
-    like the other two. This shape has no LAO/measurement-points sheet at all.
+  - BHP/Westrac (COMPONENTS + PARTS sheets, merged into one NEO source — see
+    prompts/appendix.bhp.md and config/customers/bhp.json's `merge_candidates`): NEO
+    only, verified against test-data/New-BHP-Workfile/260911 Westrac Consumption
+    File.xlsx + bhp-cross-reference.csv. Neither sheet carries a Component Code /
+    Modifier Code column at all — both are recovered entirely from
+    bhp_cross-reference.csv, replicating the "Cross Ref Key: Serial Prefix &
+    Component Unique Code & Location position" join documented in BHP's own "BHP
+    logic diagram.xlsx": AssetName (SORT_FIELD) + StrategyTaskDescription
+    (MATERIAL_DESCRIPTION) + LOCATION_POSITION build the join key, except Serial
+    Prefix isn't itself a source-file column — it's a per-asset AMT attribute BHP's
+    real workfile looks up from a 'Comp Grid'/AMT sheet this project has no access to.
+    Since bhp_cross-reference.csv already carries one consistent Serial Prefix per
+    SORT_FIELD (verified: every one of 220 distinct assets in the supplied file maps
+    to exactly one Serial Prefix), that same file is used self-referentially as the
+    asset -> Serial Prefix lookup, avoiding the need for a live AMT feed. A key that's
+    ambiguous in the cross-reference (resolves to more than one distinct CC/MC pair —
+    22 of 961 keys in the supplied file) is correctly left blank rather than guessed
+    (see _index_csv_unique_by). Coverage is genuinely partial and asymmetric by
+    design, not a bug: bhp_cross-reference.csv is a COMPONENT-level catalog (engines,
+    transmissions, drives), so COMPONENTS rows hit it at a real, meaningful rate while
+    PARTS rows (granular consumables — filters, hoses, enclosures) mostly don't
+    exist in it at all — this is exactly why PARTS is merged into the same NEO source
+    rather than driving its own LAO (see prompts/appendix.bhp.md). SerialNumber comes
+    straight from each sheet's own SERIAL_NUMBER column (real but sparse — no
+    cross-reference fallback exists for it, same treatment as before).
   - Thiess/MACA (combined Westrac workbook — see prompts/appendix.thiess.md): neither
     Supply Plan (NEO) nor Component History (LAO) carries Component Code/Modifier Code
     at all; both are recovered from thiess_cross-reference.csv, keyed on (bare Model,
@@ -277,19 +291,29 @@ def _fill_blank(out: pd.DataFrame, col: str, values: pd.Series) -> int:
     incoming_blank = incoming.isna() | (incoming.astype(str).str.strip().isin(("", "nan")))
     fillable = current_blank & ~incoming_blank
     if fillable.any():
+        # An all-blank customer_file column (e.g. a real "Component Code" header with
+        # every cell empty) comes out of builders.build_target as a float64 NaN series —
+        # pandas' dtype for an all-empty numeric-looking Excel column — not object/str.
+        # Assigning string values into that column raises pandas' LossySetitemError
+        # ("Invalid value ... for dtype 'float64'"), crashing the whole run. Cast to
+        # object first so filling in a real string code always works regardless of what
+        # dtype the untouched blanks happened to carry.
+        if out[col].dtype != object:
+            out[col] = out[col].astype(object)
         out.loc[fillable, col] = incoming[fillable]
     return int(fillable.sum())
 
 
-_AMT_RE = re.compile(r"^\s*(?P<cc>\d+)\s*-\s*(?P<desc>.+?)-(?P<mc>\S+)\s*-\s*\([^)]*\)\s*$")
-
-
-def _parse_amt(amt) -> tuple[str, str]:
-    """'1361 - WATER PUMP-00 - (NONE)' -> ('1361', '00'). Best-effort: returns ('','')
-    for anything that doesn't match the observed BHP AMT-string shape.
+def _lead_code(v) -> str:
+    """'1000 - ENGINE' -> '1000', '00 - (NONE)' -> '00', 'LF - LEFT FRONT' -> 'LF'.
+    bhp_cross-reference.csv's CC/MC columns are a display string (code + " - " +
+    description); the NEO/LAO output schema wants just the bare code, matching the
+    AMT convention seen in test-data/New-BHP-Workfile/BHP Workfile Sep26.xlsx's own
+    NEO extract (ComponentCode=7201, ModifierCode='LF', never the full label).
     """
-    m = _AMT_RE.match(str(amt)) if amt else None
-    return (m.group("cc"), m.group("mc")) if m else ("", "")
+    if v is None:
+        return ""
+    return str(v).split("-", 1)[0].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -400,18 +424,31 @@ def rio_tinto_lao(out: pd.DataFrame, clean_df: pd.DataFrame, resolved: dict) -> 
 
 
 def bhp_neo(out: pd.DataFrame, clean_df: pd.DataFrame, resolved: dict) -> dict:
-    model_col = resolved.get("ModelCode")
-    part_col = _find_column(clean_df, "primary part number", "bhp part no", "part number", "material")
-    if not model_col or model_col not in clean_df.columns or not part_col:
+    """Serial Prefix (derived per-asset from bhp_cross-reference.csv itself) +
+    StrategyTaskDescription (MATERIAL_DESCRIPTION) + LOCATION_POSITION -> CC/MC. See
+    this module's docstring for the full derivation and why coverage is intentionally
+    partial. clean_df here is the merged COMPONENTS+PARTS frame (see
+    mapping_engine._resolve_workbook_roles's merge_candidates).
+    """
+    asset_col = resolved.get("AssetName")
+    matdesc_col = resolved.get("StrategyTaskDescription")
+    if not asset_col or asset_col not in clean_df.columns or not matdesc_col or matdesc_col not in clean_df.columns:
         return {}
+    locpos_col = _find_column(clean_df, "location_position", "location position")
 
-    xref = _index_csv("bhp_cross-reference.csv", "CONCAT2")
-    join_key = clean_df[model_col].fillna("").astype(str).str.strip() + clean_df[part_col].fillna("").astype(str).str.strip()
-    hits = join_key.map(xref.get)
-    parsed = hits.map(lambda h: _parse_amt(h.get("AMT", "")) if h else ("", ""))
+    asset_rows = _index_csv("bhp_cross-reference.csv", "SORT_FIELD")
+    key_index = _index_csv_unique_by("bhp_cross-reference.csv", "SPx & Mat Desc", ("CC", "MC"))
 
-    cc_filled = _fill_blank(out, "ComponentCode", parsed.map(lambda t: t[0]))
-    mc_filled = _fill_blank(out, "ModifierCode", parsed.map(lambda t: t[1]))
+    asset = clean_df[asset_col].fillna("").astype(str).str.strip()
+    prefix = asset.map(lambda a: asset_rows.get(a, {}).get("Serial Prefix", ""))
+    matdesc = clean_df[matdesc_col].fillna("").astype(str)
+    locpos = clean_df[locpos_col].fillna("").astype(str) if locpos_col else pd.Series("", index=clean_df.index)
+
+    join_key = prefix + matdesc + locpos
+    hits = join_key.map(key_index.get)
+
+    cc_filled = _fill_blank(out, "ComponentCode", hits.map(lambda h: _lead_code(h.get("CC", "")) if h else ""))
+    mc_filled = _fill_blank(out, "ModifierCode", hits.map(lambda h: _lead_code(h.get("MC", "")) if h else ""))
     return {"ComponentCode": cc_filled, "ModifierCode": mc_filled}
 
 

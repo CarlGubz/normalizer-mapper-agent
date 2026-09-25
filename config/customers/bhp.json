@@ -1,0 +1,136 @@
+{
+  "customer_id": "bhp",
+  "description": "BHP/Westrac Consumption File workbook (COMPONENTS + PARTS sheets — see prompts/appendix.bhp.md and 'BHP logic diagram.xlsx'). NEO only: both sheets are merged into one source (merge_candidates below), matching how BHP's own master workfile (BHP Workfile Sep26.xlsx) pulls the earliest matching REQUIREMENT_DATE from either sheet into one NEO update. There is no separate LAO source for this shape — PARTS is granular consumables (filters, hoses, enclosures) that bhp_cross-reference.csv (a COMPONENT-level catalog) essentially never matches, so treating it as its own LAO target would produce a file that's almost entirely quarantined to LAO_Exceptions.csv rather than a useful output.",
+
+  "sheet_config": [
+    {
+      "role": "LTP",
+      "target": "NEO",
+      "match_patterns": ["components", "parts"],
+      "filename_patterns": ["components", "parts"],
+      "__comment_merge_candidates": "Both COMPONENTS and PARTS match this one role and are concatenated into a single NEO source instead of picking one (see core/mapping_engine.py's _resolve_workbook_roles) — they're two granularities of the same BHP demand data, not two different sheets to choose between.",
+      "merge_candidates": true
+    }
+  ],
+
+  "constants": {
+    "StrategyUOMCode": "H",
+    "ReviewStatusCode": "Not Reviewed",
+    "NewStrategyUsageValue": "",
+    "TaskTypeCode": "RB",
+    "TaskCounterCode": "0"
+  },
+
+  "scoring": {
+    "name_weight": 0.6,
+    "value_weight": 0.4,
+    "join_bonus": 0.15,
+    "confidence_cap": 0.99,
+    "bands": { "auto_accept": 0.9, "accept_review": 0.7, "low_review": 0.5 },
+    "min_name_gate": 0.55,
+    "gate_penalty": 0.75
+  },
+
+  "normalization": {
+    "join_key_canonical": "FunctionalLoc",
+    "join_key_role": "MEASUREMENT_POINTS",
+    "reject_rules": ["missing_join_key", "missing_identity", "banner_row", "gibberish"]
+  },
+
+  "__comment_deduplication": "COMPONENTS/PARTS can carry more than one demand row for the same asset+component over time (re-forecast at a later REQUIREMENT_DATE) — keep only the latest NewStrategyDate per (AssetName, ComponentCode, ModifierCode, TaskCounterCode), same convention as default.json's NEO.",
+  "deduplication": {
+    "NEO": {
+      "group_by": ["AssetName", "ComponentCode", "ModifierCode", "TaskCounterCode"],
+      "date_field": "NewStrategyDate"
+    }
+  },
+
+  "exclusions": {
+    "field": "StrategyTaskDescription",
+    "keywords": [
+      "Hose", "Valve Set", "Harness", "Service Suspension", "Slew Bearing Inspection",
+      "Coolant Engine", "Cooling", "Insp", "Safety", "Turbo", "clean",
+      "Operators Seat", "Fuel", "Cabin", "Battery", "Batteries", "Air Cond",
+      "Aircond", "Seat Belt", "High Risk Hose", "Harnesss Service", "Ladder"
+    ]
+  },
+
+  "exceptions": {
+    "critical_fields": ["AssetName", "SerialNumber", "ComponentCode", "ModifierCode"],
+    "gibberish_fields": ["AssetName", "SerialNumber", "ComponentCode", "ModifierCode"]
+  },
+
+  "targets": {
+    "NEO": {
+      "source_sheet_role": "LTP",
+      "identity_canonical": "AssetName",
+      "output_columns": [
+        "BranchCode", "SiteCode", "FleetCode", "CustomerCode", "ModelCode", "AssetName",
+        "SerialNumber", "RegistrationCounter", "ComponentCode", "ModifierCode",
+        "TaskTypeCode", "TaskCounterCode", "StrategyTaskDescription", "FrequencyValue",
+        "LifeToDateValue", "PrimaryPartNumberCode", "NextPartNumberCode",
+        "SourceOfSupplyCode", "StrategyUOMCode", "StrategyUsageValue",
+        "NewStrategyUsageValue", "StrategyDate", "NewStrategyDate", "SalesStatusCode",
+        "ReviewStatusCode", "PartClassificationCode", "SalesLostReasonCode",
+        "SalesStatusCommentsNote", "PurchaseOrderNumber"
+      ],
+      "fields": [
+        {
+          "canonical": "ModelCode", "source_class": "enrichment", "join": "Model",
+          "__comment": "Genuinely absent — COMPONENTS/PARTS carry no Model column (only ASSET_SHORT/PLANT site codes, not a machine model). A real gap, not guessed."
+        },
+        { "canonical": "AssetName", "source_class": "customer_file", "dtype": "str", "aliases": ["sort field", "asset", "unit", "equipment"] },
+        { "canonical": "TaskCounterCode", "source_class": "constant" },
+        {
+          "canonical": "StrategyTaskDescription", "source_class": "customer_file", "dtype": "str",
+          "aliases": ["material description", "material desc", "description"],
+          "__comment": "Also the join input cross_reference.bhp_neo uses (with AssetName + LOCATION_POSITION) for the Serial-Prefix + Material-Desc lookup — see core/cross_reference.py."
+        },
+        {
+          "canonical": "FrequencyValue", "source_class": "enrichment", "join": "Frequency",
+          "__comment": "No interval/frequency column exists in this shape's source data — a real gap."
+        },
+        { "canonical": "StrategyUsageValue", "source_class": "enrichment", "join": "Strategy_Usage" },
+        {
+          "canonical": "StrategyDate", "source_class": "enrichment", "join": "Strategy_Date",
+          "__comment": "The EXISTING AMT schedule date isn't in this extract (it's a forward demand file, not a schedule export) — left for the later Snowflake AMT population step, per the project's brief."
+        },
+        {
+          "canonical": "NewStrategyDate", "source_class": "customer_file", "dtype": "date", "transform": "to_yyyymmdd",
+          "aliases": ["requirement date"],
+          "__comment": "Explicit mapping logic for this shape: REQUIREMENT_DATE -> NewStrategyDate."
+        },
+        { "canonical": "FunctionalLoc", "source_class": "customer_file", "dtype": "floc", "aliases": ["functional location description", "functional location"] },
+        { "canonical": "RegistrationCounter", "source_class": "enrichment", "join": "Registration_Counter" },
+        { "canonical": "StrategyUOMCode", "source_class": "constant" },
+        { "canonical": "ReviewStatusCode", "source_class": "constant" },
+        { "canonical": "NewStrategyUsageValue", "source_class": "constant" },
+        { "canonical": "SalesLostReasonCode", "source_class": "derived", "transform": "sales_lost_reason", "depends_on": ["SalesStatusCode"] },
+        { "canonical": "SourceOfSupplyCode", "source_class": "derived", "transform": "source_of_supply", "depends_on": ["PrimaryPartNumberCode"] },
+        { "canonical": "BranchCode", "source_class": "enrichment", "join": "Branch" },
+        { "canonical": "SiteCode", "source_class": "enrichment", "join": "Site" },
+        { "canonical": "FleetCode", "source_class": "enrichment", "join": "Fleet" },
+        { "canonical": "CustomerCode", "source_class": "enrichment", "join": "Customer" },
+        {
+          "canonical": "SerialNumber", "source_class": "customer_file", "dtype": "str",
+          "aliases": ["serial number", "serial no", "serial num"],
+          "__comment_exclude_headers": "A 'Serial Prefix'/'Serial Pfx' column is a model-family code shared by many units, not a per-unit serial — disqualify it outright (see core/scorer.py).",
+          "exclude_headers": ["prefix", "pfx"]
+        },
+        {
+          "canonical": "ComponentCode", "source_class": "enrichment", "join": "cross_reference",
+          "__comment": "Not a real column on either sheet — entirely from bhp_cross-reference.csv's Serial-Prefix + Material-Desc join (core/cross_reference.py's bhp_neo)."
+        },
+        { "canonical": "ModifierCode", "source_class": "enrichment", "join": "cross_reference" },
+        { "canonical": "TaskTypeCode", "source_class": "constant" },
+        { "canonical": "LifeToDateValue", "source_class": "customer_file", "dtype": "numeric", "aliases": ["last smu reading", "smu reading"] },
+        { "canonical": "PrimaryPartNumberCode", "source_class": "customer_file", "dtype": "str", "aliases": ["vendor part number top vendor last 3 years", "vendor part number"] },
+        { "canonical": "NextPartNumberCode", "source_class": "enrichment", "join": "Next_Part_Number" },
+        { "canonical": "SalesStatusCode", "source_class": "enrichment", "join": "Sales_Status" },
+        { "canonical": "PartClassificationCode", "source_class": "enrichment", "join": "Part_Classification" },
+        { "canonical": "SalesStatusCommentsNote", "source_class": "enrichment", "join": "Comments" },
+        { "canonical": "PurchaseOrderNumber", "source_class": "enrichment", "join": "PO_Number" }
+      ]
+    }
+  }
+}
