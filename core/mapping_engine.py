@@ -24,6 +24,7 @@ from . import exceptions as exceptions_mod
 from . import exclusions as exclusions_mod
 from . import deduplication
 from . import row_confidence
+from . import amt_key
 from .llm_mapper import refine_mapping
 from .settings import settings, detect_prompt_variant
 
@@ -514,6 +515,14 @@ def _assemble_outputs(
         outputs[target]["ConfidenceScore"] = row_confidence.compute(
             outputs[target], tcfg.get("output_columns", []), field_confidence
         )
+
+        # AMT key (core/amt_key.py) — AssetName+ComponentCode+ModifierCode joined into
+        # one column, for downstream AMT/Snowflake population to key off directly.
+        # Same placement rationale as ConfidenceScore just above: after cross-reference
+        # enrichment (so a ComponentCode/ModifierCode the join just filled is included),
+        # before the row-removal steps below (so every companion file — NEO_Exceptions,
+        # ExcludedComponents, DuplicateDates — carries it too, not just NEO.csv/LAO.csv).
+        outputs[target]["AMTKey"] = amt_key.compute(outputs[target])
 
         # Business-rule row exclusion (core/exclusions.py) — a complete, well-mapped row
         # can still be removed from NEO/LAO entirely because of what it's ABOUT (its

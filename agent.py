@@ -74,6 +74,13 @@ numbers in mapping_report.mappings/column_confidence_summary. See
 core/row_confidence.py. Its means per file are reported in
 mapping_report.column_confidence_summary as "{target}_row_confidence_mean" and
 "{target}_Exceptions_row_confidence_mean".
+
+Every row also carries a trailing "AMTKey" column (core/amt_key.py) —
+AssetName+ComponentCode+ModifierCode concatenated (blank-safe, no separator) into one
+join key for the downstream AMT/Snowflake population step to key off directly instead
+of matching three separate columns. Same customer-agnostic treatment as
+ConfidenceScore: computed once, after cross-reference enrichment, so every companion
+file carries it too.
 """
 from __future__ import annotations
 import uuid

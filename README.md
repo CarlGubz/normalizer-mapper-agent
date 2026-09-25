@@ -516,6 +516,24 @@ the same fixed amount. See `core/row_confidence.py` for the full reasoning and
 `mapping_report.column_confidence_summary`'s `{target}_row_confidence_mean` /
 `{target}_Exceptions_row_confidence_mean` for the per-file means (§4).
 
+**`AMTKey` column.** Every row of the same files also carries a trailing `AMTKey`
+column (`core/amt_key.py`) — `AssetName`+`ComponentCode`+`ModifierCode` concatenated
+with no separator (e.g. `AssetName="DT5167"`, `ComponentCode="1000"`,
+`ModifierCode="00"` → `"DT5167100000"`) into one join key, so the later AMT/Snowflake
+population step can match a row by a single column instead of three. This isn't a new
+idea — `AssetName`/`ComponentCode`/`ModifierCode` are already treated as "the AMT-key
+pair/fields" everywhere else in this project (`core/cross_reference.py`,
+`core/exceptions.py`'s `split_blank_pair`) — `AMTKey` just makes that existing concept
+a real, visible column. The concatenation format matches BHP's own working file
+(`test-data/New-BHP-Workfile/BHP Workfile Sep26.xlsx`), whose NEO tab already builds an
+identical `Key1` column by hand (`=AD2&I2&J2` — Asset & ComponentCode & ModifierCode)
+for this exact purpose — see §17. Computed the same customer-agnostic way as
+`ConfidenceScore` just above (once, after cross-reference enrichment, so every
+companion file carries it too) — no customer config changes needed, every
+`config/customers/*.json` gets it automatically. A row missing one of the three parts
+still gets a partial key (blank part = empty string) rather than being dropped or
+blanked — same "print exactly what's known, invent nothing" rule as every other column.
+
 ## 12. Business-rule row exclusion (ExcludedComponents.csv)
 
 A row can be complete, well-mapped, and high-confidence, and still be removed from
